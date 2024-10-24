@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
-const { bucket } = require('../../firebaseAdmin'); // Adjusted path to reach firebaseAdmin.js
-const FileMetadata = require('../models/FileMetadata'); // Import the MongoDB model
+const { bucket } = require('../../firebaseAdmin');
+const FileMetadata = require('../models/FileMetadata');
 
 const router = express.Router();
 
@@ -54,6 +54,16 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
         // Clean up temporary local file
         require('fs').unlinkSync(filePath);
 
+        // Get the io instance from req.app
+        const io = req.app.get('io');
+
+        // Broadcast "updatedSoundboard" event to all clients
+        io.emit('updatedSoundboard', {
+            _id: savedFileMetadata._id,
+            url: fileUrl,
+            name: savedFileMetadata.name,
+        });
+
         // Send response to the client with the metadata
         res.status(201).json({
             _id: savedFileMetadata._id,
@@ -63,6 +73,17 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
     } catch (err) {
         console.error('Error uploading file:', err);
         res.status(500).json({ msg: 'Server error while uploading file' });
+    }
+});
+
+// Route to get all file metadata entries
+router.get('/all', async (req, res) => {
+    try {
+        const files = await FileMetadata.find();
+        res.status(200).json(files);
+    } catch (err) {
+        console.error('Error fetching file metadata:', err);
+        res.status(500).json({ msg: 'Server error while fetching file metadata' });
     }
 });
 
