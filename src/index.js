@@ -1,13 +1,17 @@
-// src/index.js
 const express = require('express');
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
+const cors = require('cors'); // Import the cors package
 const authRoutes = require('./routes/auth');
+const fileUploadRoutes = require('./routes/fileUpload'); // Import the file upload router
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Enable CORS for all requests
+app.use(cors());
 
 // Middleware to parse JSON requests
 app.use(express.json());
@@ -17,8 +21,8 @@ mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopol
     .then(() => console.log('Connected to MongoDB'))
     .catch(err => console.error('Could not connect to MongoDB:', err));
 
-// Use the authentication routes
 app.use('/api/auth', authRoutes);
+app.use('/api/files', fileUploadRoutes);
 
 // Start the server
 app.listen(PORT, () => {
