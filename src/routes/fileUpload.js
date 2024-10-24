@@ -14,6 +14,11 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
         return res.status(400).json({ msg: 'No file uploaded' });
     }
 
+    const { name } = req.body;
+    if (!name) {
+        return res.status(400).json({ msg: 'Please provide a name for the file' });
+    }
+
     try {
         const filePath = req.file.path; // Path to the temporarily stored file
         const fileName = `${Date.now()}-${req.file.originalname}`; // Create a unique name for the file
@@ -41,6 +46,7 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
         // Save file metadata to MongoDB
         const newFileMetadata = new FileMetadata({
             url: fileUrl,
+            name: name, // Store the custom name provided by the user
         });
 
         const savedFileMetadata = await newFileMetadata.save();
@@ -52,6 +58,7 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
         res.status(201).json({
             _id: savedFileMetadata._id,
             url: fileUrl,
+            name: savedFileMetadata.name, // Include the name in the response
         });
     } catch (err) {
         console.error('Error uploading file:', err);
