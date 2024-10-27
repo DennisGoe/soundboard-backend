@@ -5,10 +5,8 @@ const FileMetadata = require('../models/FileMetadata');
 
 const router = express.Router();
 
-// Set up multer for temporary storage
 const upload = multer({ dest: 'uploads/' });
 
-// File Upload Endpoint
 router.post('/upload', upload.single('mp3'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ msg: 'No file uploaded' });
@@ -20,19 +18,17 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
     }
 
     try {
-        const filePath = req.file.path; // Path to the temporarily stored file
-        const fileName = `${Date.now()}-${req.file.originalname}`; // Create a unique name for the file
+        const filePath = req.file.path; // Path to temporarily stored file
+        const fileName = `${Date.now()}-${req.file.originalname}`; // create unique name for the file
 
-        // Firebase Storage upload
         const firebaseFile = bucket.file(fileName);
         const options = {
             metadata: {
                 contentType: req.file.mimetype,
             },
-            public: true, // Make the file publicly accessible
+            public: true,
         };
 
-        // Upload to Firebase Storage
         await new Promise((resolve, reject) => {
             require('fs').createReadStream(filePath)
                 .pipe(firebaseFile.createWriteStream(options))
@@ -40,13 +36,11 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
                 .on('error', reject);
         });
 
-        // Get the public URL for the uploaded file
         const fileUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
 
-        // Save file metadata to MongoDB
         const newFileMetadata = new FileMetadata({
             url: fileUrl,
-            name: name, // Store the custom name provided by the user
+            name: name,
         });
 
         const savedFileMetadata = await newFileMetadata.save();
@@ -64,11 +58,10 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
             name: savedFileMetadata.name,
         });
 
-        // Send response to the client with the metadata
         res.status(201).json({
             _id: savedFileMetadata._id,
             url: fileUrl,
-            name: savedFileMetadata.name, // Include the name in the response
+            name: savedFileMetadata.name,
         });
     } catch (err) {
         console.error('Error uploading file:', err);
@@ -76,7 +69,7 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
     }
 });
 
-// Route to get all file metadata entries
+//get all file metadata entries
 router.get('/all', async (req, res) => {
     try {
         const files = await FileMetadata.find();

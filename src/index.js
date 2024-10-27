@@ -12,25 +12,21 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Create an HTTP server and attach Socket.IO
 const server = http.createServer(app);
 const io = socketIo(server, {
     cors: {
-        origin: "*", // Replace with your frontend domain for better security
+        origin: "*",
         methods: ["GET", "POST"],
     },
 });
 
-// Middleware to parse JSON requests
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log('Connected to MongoDB'))
     .catch(err => console.error('Could not connect to MongoDB:', err));
 
-// Socket.IO connection handling
 io.on('connection', (socket) => {
     console.log('New client connected');
     socket.on('playSound', (data) => {
@@ -43,14 +39,11 @@ io.on('connection', (socket) => {
     });
 });
 
-// Make io available globally
 app.set('io', io);
 
-// Use the authentication routes
 app.use('/api/auth', authRoutes);
 app.use('/api/files', fileUploadRoutes);
 
-// Start the server
 server.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
 });

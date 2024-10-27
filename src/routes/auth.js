@@ -36,32 +36,26 @@ router.post('/register', async (req, res) => {
     }
 });
 
-// Login Route
 router.post('/login', async (req, res) => {
     const { username, password } = req.body;
 
-    // Simple validation
     if (!username || !password) {
         return res.status(400).json({ msg: 'Please enter both username and password' });
     }
 
     try {
-        // Check if user exists
         const user = await User.findOne({ username });
         if (!user) {
             return res.status(400).json({ msg: 'Invalid credentials' });
         }
 
-        // Verify password
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
             return res.status(400).json({ msg: 'Invalid credentials' });
         }
 
-        // Create JWT payload
         const payload = { user: { id: user._id } };
 
-        // Sign token
         jwt.sign(
             payload,
             process.env.JWT_SECRET,
