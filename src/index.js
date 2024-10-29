@@ -6,6 +6,7 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const authRoutes = require('./routes/auth');
 const fileUploadRoutes = require('./routes/fileUpload');
+const favoritesRoutes = require("./routes/favorites")
 
 dotenv.config();
 
@@ -43,6 +44,7 @@ app.set('io', io);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/files', fileUploadRoutes);
+app.use('/api/favorites', favoritesRoutes)
 
 server.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
