@@ -24,7 +24,8 @@ router.post('/changeFavourite/:id', authMiddleware, async (req, res) => {
         }
 
         await user.save();
-
+        const io = req.app.get('io');
+        io.emit("updatedFavorites")
         res.status(200).json({ favourites: user.favourites });
     } catch (err) {
         console.error('Error toggling favourite sound:', err);
