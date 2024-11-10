@@ -31,8 +31,9 @@ mongoose.connect(process.env.MONGO_URI)
 io.on('connection', (socket) => {
     console.log('New client connected');
     socket.on('playSound', (data) => {
-        console.log(`Broadcasting playSound event: ${data.name}`);
-        io.emit('playSound', data); // Broadcast the sound data to all clients
+        console.log(`${data.user} played sound: ${data.sound.name}`);
+        io.emit('playSound', data.sound);
+        io.emit("log", `${data.user} played sound: ${data.sound.name}`)
     });
 
     socket.on('disconnect', () => {
