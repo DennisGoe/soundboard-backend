@@ -68,7 +68,7 @@ router.post('/upload', upload.single('mp3'), async (req, res) => {
         res.status(500).json({ msg: 'Server error while uploading file' });
     }
 });
-
+console.log(process.env.PRIVATE_KEY.length);
 router.delete('/delete/:id', async (req, res) => {
     const { id } = req.params;
 
