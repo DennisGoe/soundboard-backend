@@ -33,7 +33,7 @@ io.on('connection', (socket) => {
     socket.on('playSound', (data) => {
         console.log(`${data.user} played sound: ${data.sound.name}`);
         io.emit('playSound', data.sound);
-        io.emit("log", `${new Date().toLocaleTimeString()} ${data.user} played sound: ${data.sound.name}`)
+        io.emit("log", `${new Date().toLocaleTimeString("de-DE", { hour12: false })} ${data.user} played sound: ${data.sound.name}`)
     });
 
     socket.on('disconnect', () => {
