@@ -4,13 +4,6 @@ const dotenv = require("dotenv");
 // Load env vars FIRST
 dotenv.config();
 
-
-console.log("PRIVATE KEY FROM ENV RAW:");
-console.log(process.env.PRIVATE_KEY);
-
-console.log("AFTER REPLACE:");
-console.log(process.env.PRIVATE_KEY.replace(/\\n/g, '\n'));
-
 const serviceAccount = {
     type: "service_account",
     project_id: "soundboard-84dec",

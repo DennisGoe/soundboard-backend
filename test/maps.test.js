@@ -10,7 +10,7 @@ const http = require('http');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 
 process.env.JWT_SECRET = 'test-secret';
-const mapsRoutes = require('../src/routes/maps');
+const { createApp } = require('../src/app');
 const Map = require('../src/models/Map');
 const { seedExampleMap, EXAMPLE_NAME } = require('../src/seedExampleMap');
 
@@ -62,9 +62,11 @@ function fail(desc, extra) {
     const mem = await MongoMemoryServer.create();
     await mongoose.connect(mem.getUri(), { dbName: 'maps-test' });
 
-    const app = express();
-    app.use(express.json({ limit: '10mb' }));
-    app.use('/api/maps', mapsRoutes);
+    // WICHTIG: createApp() baut dieselbe Middleware-Kette wie src/index.js.
+    // Nicht selbst `express.json({limit:'10mb'})` mounten — sonst testen wir
+    // ein Setup, das in Produktion gar nicht existiert, und verdecken Bugs
+    // wie das 413-Payload-Limit (vgl. "Gross-Doc"-Section unten).
+    const app = createApp({ includeFileUploads: false });
     const server = http.createServer(app).listen(0);
 
     const userA = new mongoose.Types.ObjectId();
@@ -171,6 +173,19 @@ function fail(desc, extra) {
         ok('Doc-Update speichert Mixed-Felder korrekt');
 
         section('Grosses Doc');
+        // Gegenprobe zum 413-Bug: in Produktion lief das globale
+        // express.json() (Default 100 kB) VOR dem /api/maps-Mount mit 10mb.
+        // Ergebnis: POST/PUT mit > 100 kB Body wurde mit 413 abgewiesen,
+        // obwohl die Maps-Route explizit 10 MB erlaubt. Dieser Test prueft
+        // die ECHTE Middleware-Reihenfolge aus src/app.js.
+        const bigPaintSmall = 'A'.repeat(200 * 1024);
+        r = await req(server, 'PUT', `/api/maps/${mapAid}`, {
+            token: tokA, body: { doc: { objects: [], paint: bigPaintSmall } },
+        });
+        assert.strictEqual(r.status, 200);
+        assert.strictEqual(r.body.map.doc.paint.length, bigPaintSmall.length);
+        ok('200 KB Doc (> 100 kB Default-Limit) wird akzeptiert');
+
         // ~500KB base64-Grid -> 500 kB JSON etwa
         const bigPaint = 'A'.repeat(500 * 1024);
         r = await req(server, 'PUT', `/api/maps/${mapAid}`, {
