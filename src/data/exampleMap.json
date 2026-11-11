@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "houses": { "overrides": {}, "extra": [] },
+  "objects": [],
+  "procOverrides": {},
+  "paths": [],
+  "brushes": { "paths": [], "fields": [], "trees": [], "water": [], "terrain": [] },
+  "terrain": null,
+  "paint": null
+}

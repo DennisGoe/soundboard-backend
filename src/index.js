@@ -7,6 +7,8 @@ const cors = require('cors');
 const authRoutes = require('./routes/auth');
 const fileUploadRoutes = require('./routes/fileUpload');
 const favoritesRoutes = require("./routes/favorites")
+const mapsRoutes = require('./routes/maps');
+const { seedExampleMap } = require('./seedExampleMap');
 
 dotenv.config();
 
@@ -25,7 +27,10 @@ app.use(cors());
 app.use(express.json());
 
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log('Connected to MongoDB'))
+    .then(() => {
+        console.log('Connected to MongoDB');
+        seedExampleMap();
+    })
     .catch(err => console.error('Could not connect to MongoDB:', err));
 
 io.on('connection', (socket) => {
@@ -46,6 +51,11 @@ app.set('io', io);
 app.use('/api/auth', authRoutes);
 app.use('/api/files', fileUploadRoutes);
 app.use('/api/favorites', favoritesRoutes)
+// Maps: eigene express.json-Mount mit groesserem Limit, weil sceneDoc das
+// Terrain-/Paint-Grid als Base64 enthalten kann (Messung: ~180KB bei voll
+// bemaltem 192x192-Grid; 10 MB laesst ausreichend Puffer fuer kuenftige
+// Dichte-Erhoehungen und bleibt unter dem Mongo-Dokumentlimit von 16 MB).
+app.use('/api/maps', express.json({ limit: '10mb' }), mapsRoutes);
 
 server.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
