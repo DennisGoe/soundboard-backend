@@ -17,12 +17,15 @@ const MapSchema = new mongoose.Schema(
             default: null,
             index: true,
         },
-        // 3d  = sceneDoc des D&D-Builders (doc befuellt, imageUrl leer)
-        // 2d-image = hochgeladenes Bild (imageUrl befuellt, doc leer)
+        // 3d        = sceneDoc des D&D-Builders (doc befuellt, imageUrl leer)
+        // 2d-image  = hochgeladenes Bild (imageUrl befuellt, doc leer)
+        // 2d-editor = im Browser gebaute Battlemap (doc im Editor-Format
+        //             {width,height,floor[],walls[],objects[],labels[]}, siehe
+        //             FE/src/mapEditor/engine.ts). Validierung in routes/maps.js.
         // Bestehende Dokumente ohne das Feld werden als 3d behandelt (Default).
         kind: {
             type: String,
-            enum: ['3d', '2d-image'],
+            enum: ['3d', '2d-image', '2d-editor'],
             default: '3d',
             index: true,
         },

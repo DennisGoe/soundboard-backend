@@ -24,6 +24,83 @@ function isPlainObject(v) {
     return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
+// Grob-Validierung eines 2d-editor-Docs. Haelt Produktion vor abartig grossen
+// oder absichtlich kaputten Clients. Pedanterie (zB einzelne Wand-Koordinaten
+// mit bogus ids) uebernimmt der Renderer stillschweigend — die harten Grenzen
+// hier schuetzen vor DoS und Datenschrott. Siehe FE/src/mapEditor/engine.ts
+// fuer die eigentliche Doc-Form.
+function validateEditorDoc(doc) {
+    if (!isPlainObject(doc)) return 'doc must be an object';
+    const w = doc.width, h = doc.height;
+    if (!Number.isInteger(w) || w < 4 || w > 200) return 'width must be int 4..200';
+    if (!Number.isInteger(h) || h < 4 || h > 200) return 'height must be int 4..200';
+    if (!Array.isArray(doc.floor)) return 'floor must be array';
+    if (doc.floor.length !== w * h) return 'floor length must equal width*height';
+    for (const v of doc.floor) {
+        if (!Number.isInteger(v) || v < 0 || v > 32) return 'floor entry out of range';
+    }
+    if (!Array.isArray(doc.walls)) return 'walls must be array';
+    if (doc.walls.length > 20000) return 'too many walls';
+    for (const wl of doc.walls) {
+        if (!isPlainObject(wl)) return 'wall entry not object';
+        if (!Array.isArray(wl.a) || wl.a.length !== 2) return 'wall.a invalid';
+        if (!Array.isArray(wl.b) || wl.b.length !== 2) return 'wall.b invalid';
+        if (!Number.isInteger(wl.a[0]) || !Number.isInteger(wl.a[1])) return 'wall endpoint not int';
+        if (!Number.isInteger(wl.b[0]) || !Number.isInteger(wl.b[1])) return 'wall endpoint not int';
+        if (wl.kind && wl.kind !== 'wall' && wl.kind !== 'door') return 'wall.kind invalid';
+    }
+    if (!Array.isArray(doc.objects)) return 'objects must be array';
+    if (doc.objects.length > 5000) return 'too many objects';
+    for (const o of doc.objects) {
+        if (!isPlainObject(o)) return 'object entry not object';
+        if (typeof o.type !== 'string' || o.type.length > 32) return 'object.type invalid';
+        if (typeof o.x !== 'number' || typeof o.y !== 'number') return 'object pos invalid';
+    }
+    if (!Array.isArray(doc.labels)) return 'labels must be array';
+    if (doc.labels.length > 2000) return 'too many labels';
+    for (const l of doc.labels) {
+        if (!isPlainObject(l)) return 'label entry not object';
+        if (typeof l.text !== 'string' || l.text.length > 200) return 'label.text invalid';
+        if (typeof l.x !== 'number' || typeof l.y !== 'number') return 'label pos invalid';
+    }
+    return null;
+}
+
+// Nach einem Save eines 2d-editor-Docs allen Kampagnen-Raeumen, die genau
+// diese Map als activeMap haben, die neue Version live pushen. Wir laden
+// die neue Map nicht noch einmal — doc liegt uns ja schon vor.
+async function broadcastMapUpdate(req, mapId, map) {
+    try {
+        const io = req.app.get('io');
+        if (!io) return;
+        const campaigns = await Campaign.find({ activeMapId: mapId }).select('_id');
+        if (campaigns.length === 0) return;
+        const payload = {
+            mapId: String(mapId),
+            map: {
+                _id: String(map._id),
+                name: map.name,
+                kind: map.kind,
+                owner: map.owner,
+                imageUrl: map.imageUrl || null,
+                isExample: map.isExample,
+                createdAt: map.createdAt,
+                updatedAt: map.updatedAt,
+                doc: map.doc,
+            },
+        };
+        for (const c of campaigns) {
+            io.to(`campaign:${c._id}`).emit('campaign:mapUpdated', {
+                campaignId: String(c._id),
+                ...payload,
+            });
+        }
+    } catch (e) {
+        // live push ist best-effort — ein Fehler hier darf den Save nicht killen
+        console.error('broadcastMapUpdate error:', e);
+    }
+}
+
 // Zusaetzlich zu eigenen + Beispielen sollen Mitspieler die Maps sehen,
 // die in einer Kampagne auftauchen, in der sie Owner oder Spieler sind.
 // Diese Funktion liefert die Menge dieser "sichtbaren" Map-Ids.
@@ -82,17 +159,26 @@ router.get('/:id', async (req, res) => {
     }
 });
 
-// POST /api/maps -> body { name, doc }. Owner wird aus JWT gesetzt. isExample
-// darf vom Client nie gesetzt werden (nur Server-Seeding erstellt Beispiele).
+// POST /api/maps -> body { name, doc, kind? }. Owner wird aus JWT gesetzt.
+// isExample darf vom Client nie gesetzt werden (nur Server-Seeding erstellt
+// Beispiele). kind='2d-editor' wird hier zusaetzlich grob validiert, damit wir
+// beim Save im Editor direkt Feedback geben.
 router.post('/', async (req, res) => {
     try {
         const name = sanitizeName(req.body?.name);
         if (!name) return res.status(400).json({ msg: 'Name required (1-80 chars)' });
         const doc = req.body?.doc;
         if (!isPlainObject(doc)) return res.status(400).json({ msg: 'doc must be an object' });
+        const rawKind = req.body?.kind;
+        const kind = rawKind === '2d-editor' ? '2d-editor' : '3d';
+        if (kind === '2d-editor') {
+            const err = validateEditorDoc(doc);
+            if (err) return res.status(400).json({ msg: err });
+        }
         const map = await Map.create({
             name,
             owner: req.user.id,
+            kind,
             doc,
             isExample: false,
         });
@@ -123,6 +209,11 @@ router.put('/:id', async (req, res) => {
         }
         if (req.body?.doc !== undefined) {
             if (!isPlainObject(req.body.doc)) return res.status(400).json({ msg: 'doc must be an object' });
+            // Fuer 2d-editor-Karten: Doc nach demselben Schema wie beim POST pruefen.
+            if (map.kind === '2d-editor') {
+                const vErr = validateEditorDoc(req.body.doc);
+                if (vErr) return res.status(400).json({ msg: vErr });
+            }
             patch.doc = req.body.doc;
         }
         if (Object.keys(patch).length === 0) return res.json({ map });
@@ -130,6 +221,10 @@ router.put('/:id', async (req, res) => {
         // Mongoose erkennt Mixed-Aenderungen nicht automatisch.
         if (patch.doc) map.markModified('doc');
         await map.save();
+        // 2d-editor-Karten im aktiven Kampagnenraum sofort allen Sockets pushen.
+        if (map.kind === '2d-editor' && patch.doc) {
+            await broadcastMapUpdate(req, map._id, map);
+        }
         res.json({ map });
     } catch (err) {
         console.error('Error updating map:', err);
