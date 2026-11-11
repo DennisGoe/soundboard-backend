@@ -17,6 +17,20 @@ const MapSchema = new mongoose.Schema(
             default: null,
             index: true,
         },
+        // 3d  = sceneDoc des D&D-Builders (doc befuellt, imageUrl leer)
+        // 2d-image = hochgeladenes Bild (imageUrl befuellt, doc leer)
+        // Bestehende Dokumente ohne das Feld werden als 3d behandelt (Default).
+        kind: {
+            type: String,
+            enum: ['3d', '2d-image'],
+            default: '3d',
+            index: true,
+        },
+        // Nur fuer kind='2d-image': Firebase-Storage-URL.
+        imageUrl: {
+            type: String,
+            default: null,
+        },
         // Freiform sceneDoc (siehe FE bilder/src/editor/sceneDoc.js). Terrain
         // und Paint sind Base64-Strings, daher muss das JSON-Limit entsprechend
         // hoch sein (siehe index.js express.json({ limit }) fuer /api/maps).

@@ -30,7 +30,8 @@
     "@types/mongoose": "^5.11.97",
     "@types/node": "^22.7.9",
     "mongodb-memory-server": "^11.3.0",
-    "nodemon": "^3.1.7"
+    "nodemon": "^3.1.7",
+    "socket.io-client": "^4.8.4"
   },
   "engines": {
     "node": ">=16 <21",

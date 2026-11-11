@@ -24,9 +24,23 @@ const CampaignSchema = new mongoose.Schema(
             required: true,
             index: true,
         },
+        // Spieler duerfen die Kampagne lesen + den Spielraum betreten,
+        // aber NICHT bearbeiten oder Maps zuweisen. Nur GM pflegt die Liste.
+        players: {
+            type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+            default: [],
+            index: true,
+        },
         mapIds: {
             type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Map' }],
             default: [],
+        },
+        // Aktuell im Spielraum angezeigte Karte. Nur GM setzt sie; der Server
+        // pusht die Aenderung per socket an alle im Raum.
+        activeMapId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Map',
+            default: null,
         },
     },
     { timestamps: true }

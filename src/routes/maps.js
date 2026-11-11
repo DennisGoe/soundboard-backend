@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const Map = require('../models/Map');
+const Campaign = require('../models/Campaign');
 const { authMiddleware } = require('../authMiddleware');
 
 const router = express.Router();
@@ -23,15 +24,32 @@ function isPlainObject(v) {
     return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
-// GET /api/maps -> Liste: eigene + Beispiele, sortiert nach updatedAt desc,
-// OHNE das doc-Feld (ListView-Performance; Clients laden Details per GET /:id).
+// Zusaetzlich zu eigenen + Beispielen sollen Mitspieler die Maps sehen,
+// die in einer Kampagne auftauchen, in der sie Owner oder Spieler sind.
+// Diese Funktion liefert die Menge dieser "sichtbaren" Map-Ids.
+async function visibleCampaignMapIds(userId) {
+    const campaigns = await Campaign.find({
+        $or: [{ owner: userId }, { players: userId }],
+    }).select('mapIds');
+    const set = new Set();
+    campaigns.forEach((c) => (c.mapIds || []).forEach((id) => set.add(String(id))));
+    return Array.from(set).map((id) => new mongoose.Types.ObjectId(id));
+}
+
+// GET /api/maps -> Liste: eigene + Beispiele + Maps aus "meinen" Kampagnen.
+// Sortiert nach updatedAt desc, OHNE das doc-Feld.
 router.get('/', async (req, res) => {
     try {
         const userId = req.user.id;
+        const extra = await visibleCampaignMapIds(userId);
         const maps = await Map.find({
-            $or: [{ owner: userId }, { isExample: true }],
+            $or: [
+                { owner: userId },
+                { isExample: true },
+                ...(extra.length > 0 ? [{ _id: { $in: extra } }] : []),
+            ],
         })
-            .select('name owner isExample createdAt updatedAt')
+            .select('name owner isExample kind imageUrl createdAt updatedAt')
             .sort({ updatedAt: -1 });
         res.json({ maps });
     } catch (err) {
@@ -40,15 +58,21 @@ router.get('/', async (req, res) => {
     }
 });
 
-// GET /api/maps/:id -> Vollstaendige Karte inkl. doc.
+// GET /api/maps/:id -> Vollstaendige Karte inkl. doc (eigene, Beispiel,
+// oder in einer meiner Kampagnen).
 router.get('/:id', async (req, res) => {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(404).json({ msg: 'Map not found' });
     try {
         const userId = req.user.id;
+        const extra = await visibleCampaignMapIds(userId);
         const map = await Map.findOne({
             _id: id,
-            $or: [{ owner: userId }, { isExample: true }],
+            $or: [
+                { owner: userId },
+                { isExample: true },
+                ...(extra.length > 0 ? [{ _id: { $in: extra } }] : []),
+            ],
         });
         if (!map) return res.status(404).json({ msg: 'Map not found' });
         res.json({ map });
