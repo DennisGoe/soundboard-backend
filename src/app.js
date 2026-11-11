@@ -8,6 +8,7 @@ const cors = require('cors');
 const authRoutes = require('./routes/auth');
 const favoritesRoutes = require('./routes/favorites');
 const mapsRoutes = require('./routes/maps');
+const campaignsRoutes = require('./routes/campaigns');
 
 /**
  * Baut die Express-App inkl. Middleware + Routen.
@@ -38,6 +39,7 @@ function createApp({ includeFileUploads = true } = {}) {
         app.use('/api/files', fileUploadRoutes);
     }
     app.use('/api/favorites', favoritesRoutes);
+    app.use('/api/campaigns', campaignsRoutes);
 
     return app;
 }
