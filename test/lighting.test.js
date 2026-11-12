@@ -45,7 +45,10 @@ const Campaign = require('../src/models/Campaign');
 const Map = require('../src/models/Map');
 const MapTokens = require('../src/models/MapTokens');
 const MapLighting = require('../src/models/MapLighting');
-const { emptyBits, toBuffer, applyFogOps, ensureFogDims, sanitizeLight } = require('../src/lightingOps');
+const {
+    emptyBits, toBuffer, applyFogOps, ensureFogDims, sanitizeLight,
+    clampOpacity, migrateFackelLight, migrateFackelLightsInDoc, runFackelMigration,
+} = require('../src/lightingOps');
 
 function tokenFor(userId) {
     return jwt.sign({ user: { id: String(userId) } }, process.env.JWT_SECRET, { expiresIn: '1h' });
@@ -373,6 +376,112 @@ function bitAt(buf, w, x, y) {
         assert.strictEqual(over.ok, false);
         assert.strictEqual(over.msg, 'too many lights');
         ok('Limit MAX_LIGHTS wirkt');
+
+        // --- Opacities (Runde 3e) ---
+        section('Unit: clampOpacity');
+        assert.strictEqual(clampOpacity(null), null);
+        assert.strictEqual(clampOpacity(undefined), null);
+        assert.strictEqual(clampOpacity('abc'), null);
+        assert.strictEqual(clampOpacity(Infinity), null);
+        assert.strictEqual(clampOpacity(NaN), null);
+        assert.strictEqual(clampOpacity(-0.5), 0);
+        assert.strictEqual(clampOpacity(1.5), 1);
+        assert.strictEqual(clampOpacity(0.5), 0.5);
+        assert.strictEqual(clampOpacity(0.123456), 0.12);
+        ok('clampOpacity validiert + clamping + runden');
+
+        section('Unit: Fackel-Migration (idempotent)');
+        const fakeLight = { bright: 20, dim: 20, label: 'Fackel' };
+        assert.strictEqual(migrateFackelLight(fakeLight), true);
+        assert.strictEqual(fakeLight.bright, 2.5);
+        assert.strictEqual(fakeLight.dim, 2.5);
+        // Nochmal: jetzt NICHT mehr matchen
+        assert.strictEqual(migrateFackelLight(fakeLight), false);
+        ok('migrateFackelLight: einmal aktualisieren, danach idempotent');
+
+        // Label passt nicht -> unveraendert
+        const nonFackel = { bright: 20, dim: 20, label: 'Lagerfeuer' };
+        assert.strictEqual(migrateFackelLight(nonFackel), false);
+        assert.strictEqual(nonFackel.bright, 20);
+        // "Fackel (20/20)" aus altem Preset-Label
+        const oldPreset = { bright: 20, dim: 20, label: 'Fackel (20/20)' };
+        assert.strictEqual(migrateFackelLight(oldPreset), true);
+        assert.strictEqual(oldPreset.bright, 2.5);
+        ok('nicht-Fackel-Lichter bleiben unberuehrt; "Fackel (20/20)" matcht');
+
+        // Doc-Level Migration + End-to-End ueber Mongo
+        const migMap = await Map.create({ name: 'MigMap', owner: gm._id, kind: '2d-editor', doc: {} });
+        const migCampaign = await Campaign.create({
+            name: 'MigTest', owner: gm._id, players: [pl._id], mapIds: [migMap._id],
+        });
+        await MapLighting.create({
+            campaignId: migCampaign._id, mapId: migMap._id,
+            fogW: 0, fogH: 0, fogBits: '', darkness: false,
+            lights: [
+                { id: 'l-old', kind: 'token', tokenId: 't', bright: 20, dim: 20, label: 'Fackel', color: '#ffbb66', enabled: true },
+                { id: 'l-keep', kind: 'static', x: 1, y: 1, bright: 20, dim: 20, label: 'Lagerfeuer', color: '#ff8a3c', enabled: true },
+            ],
+        });
+        await runFackelMigration(MapLighting);
+        const migDoc = await MapLighting.findOne({ campaignId: migCampaign._id, mapId: migMap._id });
+        const migratedFackel = migDoc.lights.find((l) => l.id === 'l-old');
+        const unchanged = migDoc.lights.find((l) => l.id === 'l-keep');
+        assert.strictEqual(migratedFackel.bright, 2.5);
+        assert.strictEqual(migratedFackel.dim, 2.5);
+        assert.strictEqual(unchanged.bright, 20);
+        ok('runFackelMigration patcht Fackel-Lichter in der DB, laesst andere in Ruhe');
+
+        // Nochmaliger Lauf aendert nichts
+        const before = JSON.stringify((await MapLighting.find({})).map((d) => d.lights));
+        await runFackelMigration(MapLighting);
+        const after = JSON.stringify((await MapLighting.find({})).map((d) => d.lights));
+        assert.strictEqual(before, after, 'migration ist idempotent');
+        ok('zweiter Migration-Lauf aendert nichts');
+
+        section('Socket: setDarknessOpacity + setFogOpacity (nur GM)');
+        const opWait = waitEvent(sPL, 'campaign:lighting:update');
+        const setDO = await callAck(sGM, 'campaign:lighting:setDarknessOpacity', {
+            campaignId: String(campaign._id), mapId: String(map._id), opacity: 0.6,
+        });
+        assert.strictEqual(setDO.ok, true);
+        assert.strictEqual(setDO.darknessOpacity, 0.6);
+        const opEv = await opWait;
+        assert.strictEqual(opEv.lighting.darknessOpacity, 0.6);
+        ok('GM setzt darknessOpacity + broadcast enthaelt den Wert');
+
+        const plDO = await callAck(sPL, 'campaign:lighting:setDarknessOpacity', {
+            campaignId: String(campaign._id), mapId: String(map._id), opacity: 0.2,
+        });
+        assert.strictEqual(plDO.ok, false);
+        ok('Spieler darf darknessOpacity nicht setzen');
+
+        const badDO = await callAck(sGM, 'campaign:lighting:setDarknessOpacity', {
+            campaignId: String(campaign._id), mapId: String(map._id), opacity: 'nope',
+        });
+        assert.strictEqual(badDO.ok, false);
+        assert.strictEqual(badDO.msg, 'opacity invalid');
+        ok('GM bekommt invalid bei nicht-numerischem Opacity');
+
+        const setFO = await callAck(sGM, 'campaign:lighting:setFogOpacity', {
+            campaignId: String(campaign._id), mapId: String(map._id), opacity: 1.5,
+        });
+        assert.strictEqual(setFO.ok, true);
+        assert.strictEqual(setFO.fogOpacity, 1, 'Werte > 1 werden geclampt');
+        ok('GM setzt fogOpacity, clampt an 1.0');
+
+        const setFOneg = await callAck(sGM, 'campaign:lighting:setFogOpacity', {
+            campaignId: String(campaign._id), mapId: String(map._id), opacity: -0.5,
+        });
+        assert.strictEqual(setFOneg.ok, true);
+        assert.strictEqual(setFOneg.fogOpacity, 0);
+        ok('negative Werte werden an 0 geclampt');
+
+        // REST-Antwort liefert die Werte zurueck
+        const res2 = await httpReq(server, 'GET', `/api/campaigns/${campaign._id}/maps/${map._id}/lighting`, { token: tokGM });
+        assert.strictEqual(res2.status, 200);
+        assert.strictEqual(res2.body.lighting.darknessOpacity, 0.6);
+        assert.strictEqual(res2.body.lighting.fogOpacity, 0);
+        ok('GET /lighting enthaelt darknessOpacity + fogOpacity');
 
         // Fremder Socket
         section('Socket: Fremder wird abgewiesen');

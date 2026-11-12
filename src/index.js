@@ -5,6 +5,8 @@ const mongoose = require('mongoose');
 const { createApp } = require('./app');
 const { seedExampleMap } = require('./seedExampleMap');
 const { attachSocket } = require('./socket');
+const { runFackelMigration } = require('./lightingOps');
+const MapLighting = require('./models/MapLighting');
 
 dotenv.config();
 
@@ -24,6 +26,11 @@ mongoose
     .then(() => {
         console.log('Connected to MongoDB');
         seedExampleMap();
+        // Einmalige, idempotente Migration der Fackel-Lichter 20/20 -> 2.5/2.5
+        // (Runde 3e). Darf Startup nicht blockieren.
+        runFackelMigration(MapLighting).catch((e) =>
+            console.error('Fackel migration failed:', e)
+        );
     })
     .catch((err) => console.error('Could not connect to MongoDB:', err));
 

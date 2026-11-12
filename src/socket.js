@@ -29,6 +29,7 @@ const {
     applyFogOps,
     ensureFogDims,
     sanitizeLight,
+    clampOpacity,
     MAX_LIGHTS,
     emptyBits,
 } = require('./lightingOps');
@@ -570,22 +571,33 @@ function attach(io) {
         async function loadLighting(campaignId, mapId) {
             return MapLighting.findOneAndUpdate(
                 { campaignId, mapId },
-                { $setOnInsert: { campaignId, mapId, fogW: 0, fogH: 0, fogBits: '', darkness: false, lights: [] } },
+                {
+                    $setOnInsert: {
+                        campaignId, mapId, fogW: 0, fogH: 0, fogBits: '',
+                        darkness: false, darknessOpacity: 1, fogOpacity: 1, lights: [],
+                    },
+                },
                 { upsert: true, new: true, setDefaultsOnInsert: true }
             );
+        }
+
+        function lightingPayload(doc) {
+            return {
+                fogW: doc.fogW,
+                fogH: doc.fogH,
+                fogBits: doc.fogBits,
+                darkness: doc.darkness,
+                darknessOpacity: typeof doc.darknessOpacity === 'number' ? doc.darknessOpacity : 1,
+                fogOpacity: typeof doc.fogOpacity === 'number' ? doc.fogOpacity : 1,
+                lights: doc.lights,
+            };
         }
 
         function broadcastLighting(campaignId, mapId, doc) {
             io.to(`campaign:${campaignId}`).emit('campaign:lighting:update', {
                 campaignId: String(campaignId),
                 mapId: String(mapId),
-                lighting: {
-                    fogW: doc.fogW,
-                    fogH: doc.fogH,
-                    fogBits: doc.fogBits,
-                    darkness: doc.darkness,
-                    lights: doc.lights,
-                },
+                lighting: lightingPayload(doc),
             });
         }
 
@@ -596,13 +608,53 @@ function attach(io) {
                 const light = await loadLighting(campaignId, mapId);
                 if (typeof ack === 'function') ack({
                     ok: true,
-                    lighting: {
-                        fogW: light.fogW, fogH: light.fogH, fogBits: light.fogBits,
-                        darkness: light.darkness, lights: light.lights,
-                    },
+                    lighting: lightingPayload(light),
                 });
             } catch (e) {
                 console.error('lighting:get error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Deckkraft fuer die Spieler-Sicht der Dunkelheit (0..1).
+        // 1 = komplett schwarz ausserhalb von Licht, 0 = Dunkelheit nicht sichtbar.
+        socket.on('campaign:lighting:setDarknessOpacity', async ({ campaignId, mapId, opacity } = {}, ack) => {
+            try {
+                const ctx = await withRoom(campaignId, mapId, true, ack);
+                if (!ctx) return;
+                const o = clampOpacity(opacity);
+                if (o === null) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'opacity invalid' });
+                    return;
+                }
+                const light = await loadLighting(campaignId, mapId);
+                light.darknessOpacity = o;
+                await light.save();
+                broadcastLighting(campaignId, mapId, light);
+                if (typeof ack === 'function') ack({ ok: true, darknessOpacity: o });
+            } catch (e) {
+                console.error('lighting:setDarknessOpacity error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Deckkraft fuer die Spieler-Sicht des Nebels (0..1).
+        socket.on('campaign:lighting:setFogOpacity', async ({ campaignId, mapId, opacity } = {}, ack) => {
+            try {
+                const ctx = await withRoom(campaignId, mapId, true, ack);
+                if (!ctx) return;
+                const o = clampOpacity(opacity);
+                if (o === null) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'opacity invalid' });
+                    return;
+                }
+                const light = await loadLighting(campaignId, mapId);
+                light.fogOpacity = o;
+                await light.save();
+                broadcastLighting(campaignId, mapId, light);
+                if (typeof ack === 'function') ack({ ok: true, fogOpacity: o });
+            } catch (e) {
+                console.error('lighting:setFogOpacity error', e);
                 if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
             }
         });

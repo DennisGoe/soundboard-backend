@@ -55,6 +55,13 @@ const MapLightingSchema = new mongoose.Schema(
         fogH: { type: Number, default: 0, min: 0, max: 400 },
         fogBits: { type: String, default: '' }, // Base64
         darkness: { type: Boolean, default: false },
+        // Deckkraft fuer die Spieler-Sicht (0..1).
+        //   darknessOpacity: wie schwarz ist Dunkelheit fuer Spieler (1 = komplett schwarz,
+        //                    0 = gar nicht). Default 1 = vorher-Verhalten.
+        //   fogOpacity:      wie dicht ist der Nebel fuer Spieler. Default 1 = voll deckend.
+        // GM hat weiterhin eigene (nur-visuelle) Slider gmDarkAlpha/gmFogAlpha im FE.
+        darknessOpacity: { type: Number, default: 1, min: 0, max: 1 },
+        fogOpacity: { type: Number, default: 1, min: 0, max: 1 },
         lights: { type: [LightSchema], default: [] },
     },
     { timestamps: true }

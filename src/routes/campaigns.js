@@ -482,13 +482,21 @@ router.get('/:id/maps/:mapId/lighting', async (req, res) => {
         if (!assigned) return res.status(404).json({ msg: 'Map not in campaign' });
         const doc = await MapLighting.findOneAndUpdate(
             { campaignId: id, mapId },
-            { $setOnInsert: { campaignId: id, mapId, fogW: 0, fogH: 0, fogBits: '', darkness: false, lights: [] } },
+            {
+                $setOnInsert: {
+                    campaignId: id, mapId, fogW: 0, fogH: 0, fogBits: '',
+                    darkness: false, darknessOpacity: 1, fogOpacity: 1, lights: [],
+                },
+            },
             { upsert: true, new: true, setDefaultsOnInsert: true }
         );
         res.json({
             lighting: {
                 fogW: doc.fogW, fogH: doc.fogH, fogBits: doc.fogBits,
-                darkness: doc.darkness, lights: doc.lights,
+                darkness: doc.darkness,
+                darknessOpacity: typeof doc.darknessOpacity === 'number' ? doc.darknessOpacity : 1,
+                fogOpacity: typeof doc.fogOpacity === 'number' ? doc.fogOpacity : 1,
+                lights: doc.lights,
             },
         });
     } catch (err) {

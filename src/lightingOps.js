@@ -229,6 +229,66 @@ function sanitizeLight(raw, currentCount) {
     return { id, kind, tokenId: null, x, y, bright, dim, color, label, enabled };
 }
 
+// Deckkraft-Validator fuer Spieler-Overlays (0..1). Ungueltig -> null.
+// Nutzt strict Number-Check: Strings, NaN, Infinity werden abgelehnt.
+function clampOpacity(v) {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    if (n < 0) return 0;
+    if (n > 1) return 1;
+    // 2 Nachkommastellen reichen, damit Sliderspam nicht die DB aufblaeht.
+    return Math.round(n * 100) / 100;
+}
+
+// Idempotente Migration der alten Fackel-Preset-Werte (20/20) auf die neue
+// Fackel (5 ft total = 2.5 bright + 2.5 dim). Kriterium bewusst strikt:
+// label beginnt mit "Fackel" UND bright===20 UND dim===20 (nur die alten Werte
+// werden angefasst, individuelle 20/20-Lampen mit anderem Label bleiben).
+// Rueckgabe: Anzahl geaenderter Lichter in doc.
+function migrateFackelLight(light) {
+    if (!light || typeof light !== 'object') return false;
+    if (light.bright !== 20 || light.dim !== 20) return false;
+    const lbl = typeof light.label === 'string' ? light.label : '';
+    if (!/^Fackel\b/.test(lbl)) return false;
+    light.bright = 2.5;
+    light.dim = 2.5;
+    return true;
+}
+
+function migrateFackelLightsInDoc(doc) {
+    if (!doc || !Array.isArray(doc.lights)) return 0;
+    let n = 0;
+    for (const l of doc.lights) {
+        if (migrateFackelLight(l)) n++;
+    }
+    return n;
+}
+
+// Laeuft einmal nach Mongo-Connect. Idempotent: nach dem Lauf matcht das
+// Kriterium (bright=20, dim=20, label=/^Fackel/) auf diese Docs nicht mehr.
+async function runFackelMigration(MapLightingModel) {
+    try {
+        const docs = await MapLightingModel.find({
+            'lights.bright': 20, 'lights.dim': 20, 'lights.label': /^Fackel/,
+        });
+        let changed = 0;
+        for (const d of docs) {
+            const n = migrateFackelLightsInDoc(d);
+            if (n > 0) {
+                d.markModified('lights');
+                await d.save();
+                changed += n;
+            }
+        }
+        if (changed > 0) {
+            console.log(`[migration] Fackel 20/20 -> 2.5/2.5 bei ${changed} Lichtern aktualisiert.`);
+        }
+    } catch (e) {
+        console.error('[migration] Fackel-Migration fehlgeschlagen:', e);
+    }
+}
+
 module.exports = {
     MAX_DIM,
     MAX_LIGHTS,
@@ -238,4 +298,8 @@ module.exports = {
     applyFogOps,
     ensureFogDims,
     sanitizeLight,
+    clampOpacity,
+    migrateFackelLight,
+    migrateFackelLightsInDoc,
+    runFackelMigration,
 };
