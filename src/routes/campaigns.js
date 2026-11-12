@@ -4,6 +4,8 @@ const Campaign = require('../models/Campaign');
 const Map = require('../models/Map');
 const User = require('../models/User');
 const ChatMessage = require('../models/ChatMessage');
+const Character = require('../models/Character');
+const MapTokens = require('../models/MapTokens');
 const { authMiddleware } = require('../authMiddleware');
 
 const router = express.Router();
@@ -102,10 +104,26 @@ function roleFor(campaign, userId) {
     return null;
 }
 
-// Serialisiert eine Kampagne inkl. Rolle + hydratisierter Spielerliste.
+// Serialisiert eine Kampagne inkl. Rolle, Spielerliste und hydratisierten
+// Charakter-Auswahlen pro User (characterSelections als Array of {userId, characterId}).
 async function serialize(campaign, userId) {
     const playerUsers = await User.find({ _id: { $in: campaign.players || [] } })
         .select('_id username');
+    // characterSelections als Map<userIdString, characterId>. Liefere ein
+    // Array raus, damit FE JSON sauber verarbeitet.
+    const selections = [];
+    const charIds = new Set();
+    if (campaign.characterSelections && campaign.characterSelections.forEach) {
+        campaign.characterSelections.forEach((charId, uid) => {
+            selections.push({ userId: uid, characterId: String(charId) });
+            charIds.add(String(charId));
+        });
+    }
+    // Zusaetzlich die Chars kurz hydratisieren (fuer Avatar/Name im Spielbrett).
+    const characters = charIds.size > 0
+        ? await Character.find({ _id: { $in: Array.from(charIds) } })
+              .select('_id owner name tokenUrl')
+        : [];
     return {
         _id: campaign._id,
         name: campaign.name,
@@ -114,6 +132,8 @@ async function serialize(campaign, userId) {
         players: playerUsers.map((u) => ({ _id: u._id, username: u.username })),
         mapIds: campaign.mapIds,
         activeMapId: campaign.activeMapId || null,
+        characterSelections: selections,
+        characters,
         createdAt: campaign.createdAt,
         updatedAt: campaign.updatedAt,
         role: roleFor(campaign, userId),
@@ -369,6 +389,76 @@ router.get('/:id/chat', async (req, res) => {
         });
     } catch (err) {
         console.error('Error loading chat:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// PUT /api/campaigns/:id/my-character  { characterId: string | null }
+// Setzt den aktuellen Charakter des aufrufenden Users (Owner oder Spieler).
+// Nur eigene Charaktere zulaessig. Pusht Socket-Event an den Raum.
+router.put('/:id/my-character', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(404).json({ msg: 'Not found' });
+    const raw = req.body?.characterId;
+    if (raw !== null && !isValidId(raw)) {
+        return res.status(400).json({ msg: 'characterId invalid' });
+    }
+    try {
+        const userId = req.user.id;
+        const campaign = await Campaign.findById(id);
+        if (!campaign || !roleFor(campaign, userId)) {
+            return res.status(404).json({ msg: 'Not found' });
+        }
+        if (raw) {
+            const c = await Character.findById(raw);
+            if (!c || String(c.owner) !== String(userId)) {
+                return res.status(403).json({ msg: 'character not yours' });
+            }
+        }
+        if (!campaign.characterSelections) campaign.characterSelections = new Map();
+        if (raw === null) {
+            campaign.characterSelections.delete(String(userId));
+        } else {
+            campaign.characterSelections.set(String(userId), new mongoose.Types.ObjectId(raw));
+        }
+        await campaign.save();
+        const io = req.app.get('io');
+        if (io) {
+            io.to(`campaign:${id}`).emit('campaign:characterSelection', {
+                campaignId: String(id),
+                userId: String(userId),
+                characterId: raw ? String(raw) : null,
+            });
+        }
+        res.json({ campaign: await serialize(campaign, userId) });
+    } catch (err) {
+        console.error('Error selecting character:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// GET /api/campaigns/:id/maps/:mapId/tokens
+// Liefert den aktuellen Token-Zustand fuer (Campaign, Map). Jeder in der
+// Kampagne darf lesen. Fehlt der Datensatz, wird ein leeres Dokument angelegt.
+router.get('/:id/maps/:mapId/tokens', async (req, res) => {
+    const { id, mapId } = req.params;
+    if (!isValidId(id) || !isValidId(mapId)) return res.status(404).json({ msg: 'Not found' });
+    try {
+        const userId = req.user.id;
+        const campaign = await Campaign.findById(id);
+        if (!campaign || !roleFor(campaign, userId)) {
+            return res.status(404).json({ msg: 'Not found' });
+        }
+        const assigned = (campaign.mapIds || []).some((m) => String(m) === String(mapId));
+        if (!assigned) return res.status(404).json({ msg: 'Map not in campaign' });
+        const doc = await MapTokens.findOneAndUpdate(
+            { campaignId: id, mapId },
+            { $setOnInsert: { campaignId: id, mapId, tokens: [], groups: [] } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        res.json({ tokens: doc.tokens, groups: doc.groups });
+    } catch (err) {
+        console.error('Error loading tokens:', err);
         res.status(500).json({ msg: 'Server error' });
     }
 });

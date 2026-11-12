@@ -47,6 +47,17 @@ const MapSchema = new mongoose.Schema(
             default: false,
             index: true,
         },
+        // Nur fuer kind='2d-image': Raster-Overlay (Feldgroesse in Bildpixeln,
+        // Versatz, Sichtbarkeit, Farbe, Deckkraft). cellPx=null -> nichts gesetzt,
+        // Client zeigt Schaetzwert und bittet GM ums Kalibrieren.
+        grid: {
+            cellPx: { type: Number, default: null },
+            offsetX: { type: Number, default: 0 },
+            offsetY: { type: Number, default: 0 },
+            show: { type: Boolean, default: true },
+            color: { type: String, default: '#000000' },
+            opacity: { type: Number, default: 0.4, min: 0, max: 1 },
+        },
     },
     { timestamps: true, minimize: false }
 );

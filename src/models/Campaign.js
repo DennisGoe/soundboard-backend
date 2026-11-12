@@ -42,6 +42,13 @@ const CampaignSchema = new mongoose.Schema(
             ref: 'Map',
             default: null,
         },
+        // Pro Spieler (und GM!) der gerade gewaehlte Charakter. Map<userId, characterId>.
+        // Nur eine Zuordnung pro User; Spieler kann sie jederzeit aendern.
+        characterSelections: {
+            type: Map,
+            of: { type: mongoose.Schema.Types.ObjectId, ref: 'Character' },
+            default: () => new Map(),
+        },
     },
     { timestamps: true }
 );

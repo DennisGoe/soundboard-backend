@@ -232,6 +232,76 @@ router.put('/:id', async (req, res) => {
     }
 });
 
+// PUT /api/maps/:id/grid -> { grid } Nur Owner. Fuer 2d-image-Karten das
+// Raster-Overlay setzen. Pusht ueber Sockets in alle aktiven Spielraeume.
+function sanitizeGrid(raw) {
+    if (raw === null || raw === undefined) return { ok: true, value: null };
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, msg: 'grid must be object or null' };
+    }
+    const out = {};
+    if (raw.cellPx === null) out.cellPx = null;
+    else if (typeof raw.cellPx === 'number' && Number.isFinite(raw.cellPx) && raw.cellPx > 0 && raw.cellPx < 10000) {
+        out.cellPx = raw.cellPx;
+    } else return { ok: false, msg: 'grid.cellPx invalid' };
+    for (const k of ['offsetX', 'offsetY']) {
+        if (raw[k] === undefined) out[k] = 0;
+        else if (typeof raw[k] === 'number' && Number.isFinite(raw[k])) out[k] = raw[k];
+        else return { ok: false, msg: `grid.${k} invalid` };
+    }
+    if (raw.show === undefined) out.show = true;
+    else if (typeof raw.show === 'boolean') out.show = raw.show;
+    else return { ok: false, msg: 'grid.show invalid' };
+    if (raw.color === undefined) out.color = '#000000';
+    else if (typeof raw.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(raw.color)) out.color = raw.color;
+    else return { ok: false, msg: 'grid.color must be #RRGGBB' };
+    if (raw.opacity === undefined) out.opacity = 0.4;
+    else if (typeof raw.opacity === 'number' && raw.opacity >= 0 && raw.opacity <= 1) out.opacity = raw.opacity;
+    else return { ok: false, msg: 'grid.opacity must be 0..1' };
+    return { ok: true, value: out };
+}
+
+router.put('/:id/grid', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(404).json({ msg: 'Map not found' });
+    try {
+        const map = await Map.findById(id);
+        if (!map) return res.status(404).json({ msg: 'Map not found' });
+        if (map.isExample) return res.status(403).json({ msg: 'Example maps are read-only' });
+        if (!map.owner || String(map.owner) !== String(req.user.id)) {
+            return res.status(403).json({ msg: 'Not allowed' });
+        }
+        if (map.kind !== '2d-image') {
+            return res.status(400).json({ msg: 'grid only for kind=2d-image' });
+        }
+        const check = sanitizeGrid(req.body?.grid);
+        if (!check.ok) return res.status(400).json({ msg: check.msg });
+        map.grid = check.value || undefined;
+        await map.save();
+        // Alle Kampagnenraeume, in denen diese Map gerade aktiv ist, benachrichtigen.
+        try {
+            const io = req.app.get('io');
+            if (io) {
+                const camps = await Campaign.find({ activeMapId: map._id }).select('_id');
+                const payload = {
+                    mapId: String(map._id),
+                    grid: map.grid || null,
+                };
+                for (const c of camps) {
+                    io.to(`campaign:${c._id}`).emit('campaign:mapGrid', {
+                        campaignId: String(c._id),
+                        ...payload,
+                    });
+                }
+            }
+        } catch (e) { console.error('grid broadcast error:', e); }
+        res.json({ map });
+    } catch (err) {
+        console.error('Error updating grid:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
 // DELETE /api/maps/:id -> nur Owner, Beispiele nie.
 router.delete('/:id', async (req, res) => {
     const { id } = req.params;

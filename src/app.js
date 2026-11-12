@@ -10,6 +10,7 @@ const favoritesRoutes = require('./routes/favorites');
 const mapsRoutes = require('./routes/maps');
 const campaignsRoutes = require('./routes/campaigns');
 const usersRoutes = require('./routes/users');
+const charactersRoutes = require('./routes/characters');
 
 /**
  * Baut die Express-App inkl. Middleware + Routen.
@@ -43,10 +44,14 @@ function createApp({ includeFileUploads = true } = {}) {
     if (includeFileUploads) {
         const fileUploadRoutes = require('./routes/fileUpload');
         app.use('/api/files', fileUploadRoutes);
+        // Char-Token-Upload (multipart, kein JSON-Parser).
+        const characterUploadRoutes = require('./routes/characterUpload');
+        app.use('/api/characters', characterUploadRoutes);
     }
     app.use('/api/favorites', favoritesRoutes);
     app.use('/api/campaigns', campaignsRoutes);
     app.use('/api/users', usersRoutes);
+    app.use('/api/characters', charactersRoutes);
 
     return app;
 }
