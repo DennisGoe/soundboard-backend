@@ -185,11 +185,28 @@ function findFreeField(tokens, worldW, worldH, cx, cy) {
 // Idempotent: existiert fuer diesen Spieler schon ein Token auf der Karte, nichts tun.
 // Sonst anlegen und doc.save + Rueckgabe {doc, created}. Nutzt characterSelection als
 // visuelles Default (characterId + ownerUserId), sonst nur ownerUserId + Kuerzel.
+//
+// Nachbesserung (4a2): label = username des Owners -> das FE kann daraus die
+// Initialen (2 Zeichen) + Palettenfarbe exakt wie in der Praesenz-Leiste ableiten,
+// auch wenn der User offline / nicht in presence ist. Bereits vorhandene
+// Auto-Tokens ohne label werden hier zudem nachtraeglich mit dem Username versehen.
 async function ensureAutoTokenForPlayer({ campaign, mapId, userId }) {
-    const map = await MapModel.findById(mapId);
+    const [map, user] = await Promise.all([
+        MapModel.findById(mapId),
+        User.findById(userId).select('username'),
+    ]);
+    const username = user?.username || '';
     const doc = await loadMapTokens(campaign._id, mapId);
-    const already = doc.tokens.some((t) => String(t.ownerUserId || '') === String(userId));
-    if (already) return { doc, created: null };
+    const existing = doc.tokens.find((t) => String(t.ownerUserId || '') === String(userId));
+    if (existing) {
+        // Alt-Daten migrieren: leere oder unsinnige Labels bekommen den Username.
+        if (username && (!existing.label || existing.label === '?')) {
+            existing.label = username;
+            doc.markModified('tokens');
+            await doc.save();
+        }
+        return { doc, created: null };
+    }
     const dims = worldDimsForMap(map);
     const spot = findFreeField(doc.tokens, dims.w, dims.h, dims.w / 2, dims.h / 2);
     // Char fuer visuelles Default aus Campaign.characterSelections.
@@ -204,7 +221,7 @@ async function ensureAutoTokenForPlayer({ campaign, mapId, userId }) {
         id: `tok-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
         characterId: charId ? new mongoose.Types.ObjectId(String(charId)) : null,
         ownerUserId: new mongoose.Types.ObjectId(String(userId)),
-        label: '',
+        label: username,
         color: '#9b2a1e',
         x: spot.x,
         y: spot.y,

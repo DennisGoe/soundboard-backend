@@ -265,6 +265,53 @@ function callAck(sock, event, payload, ms = 2000) {
         assert.strictEqual(gmTok, undefined);
         ok('Kein Token mit ownerUserId=gm vorhanden');
 
+        section('Nachbesserung 4a2: Auto-Token-Label = Username des Owners');
+        // Alice hat beim Join oben ein Auto-Token bekommen. BE setzt label=username,
+        // damit das FE daraus Initialen + Palettenfarbe exakt wie in der Fussleiste
+        // ableiten kann.
+        const aliceAutoTok = tksFinal.find((t) => String(t.ownerUserId) === String(alice._id));
+        assert.ok(aliceAutoTok, 'Alice-Auto-Token existiert');
+        assert.strictEqual(aliceAutoTok.label, 'alice',
+            `Auto-Token-label muss = username sein (got "${aliceAutoTok.label}")`);
+        ok('Auto-Token.label = Owner-Username (nicht "")');
+
+        section('Nachbesserung 4a2: Migration eines Alt-Tokens ohne Label');
+        // Legt ein zweites Campaign+Map an, pfuscht direkt in der DB ein Alt-Token
+        // ohne Label an und prueft, dass ein erneuter ensureAutoTokenForPlayer
+        // (via join) das Label nachtraegt.
+        const chuck = await User.create({ username: 'chuck', password: 'x' });
+        const map2 = await MapModel.create({
+            name: 'Keller', owner: gm._id, kind: '2d-editor',
+            doc: { width: 15, height: 10, tileSize: 32, floor: [], walls: [], objects: [], labels: [] },
+        });
+        const camp2 = await Campaign.create({
+            name: 'MigrateTest', owner: gm._id,
+            players: [chuck._id], mapIds: [map2._id], activeMapId: map2._id,
+        });
+        // Alt-Datensatz: Token mit leerem Label, aber mit ownerUserId=chuck.
+        await MapTokens.create({
+            campaignId: camp2._id, mapId: map2._id,
+            tokens: [{
+                id: 'tok-legacy-1',
+                ownerUserId: chuck._id,
+                characterId: null,
+                label: '', color: '#9b2a1e',
+                x: 5, y: 5, size: 1, groupId: null, locked: false,
+            }],
+            groups: [],
+        });
+        const sChuck = await connect(port, tokenFor(chuck._id));
+        await callAck(sChuck, 'campaign:join', { campaignId: String(camp2._id) });
+        // Kurz auf Broadcast warten.
+        await new Promise((r) => setTimeout(r, 200));
+        const td2 = await MapTokens.findOne({ campaignId: camp2._id, mapId: map2._id });
+        const chTok = td2.tokens.find((t) => String(t.ownerUserId) === String(chuck._id));
+        assert.ok(chTok, 'Chuck-Token existiert');
+        assert.strictEqual(chTok.label, 'chuck',
+            `Alt-Token-Label wurde migriert auf Username (got "${chTok.label}")`);
+        ok('Alt-Token ohne Label bekommt beim Re-Join den Username eingetragen');
+        sChuck.close();
+
         sGm.close(); sAlice.close(); sAlice2.close(); sBob.close(); sOut.close();
 
         console.log('\nAlles gruen (tokens-live.test.js).');
