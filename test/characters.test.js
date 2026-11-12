@@ -203,6 +203,19 @@ function fail(d, e) { console.log(`  FAIL ${d}${e ? ' :: ' + e : ''}`); process.
         }
         ok('Alle 3 beigetreten');
 
+        // Runde 4a: Spieler bekommen beim Join automatisch je ein Token auf der
+        // aktiven Karte. Damit wir die weiteren Assertions deterministisch halten,
+        // warten wir erst auf das Abschliessen der Auto-Adds (Socket-Events werden
+        // pro Socket in Reihenfolge verarbeitet -> ein weiteres `tokens:get` auf
+        // dem Spieler-Socket feuert erst NACH dem Auto-Add) und leeren dann.
+        await new Promise((r) => cAlice.emit('campaign:tokens:get', { campaignId: String(camp._id), mapId: String(img._id) }, r));
+        await new Promise((r) => cBob.emit('campaign:tokens:get', { campaignId: String(camp._id), mapId: String(img._id) }, r));
+        await MapTokens.updateMany(
+            { campaignId: camp._id, mapId: img._id },
+            { $set: { tokens: [], groups: [] } },
+        );
+        ok('Auto-Tokens (R4a) fuer kontrolliertes Scenario entfernt');
+
         // GM fuegt Alices Token hinzu
         let updatePromise = new Promise((resolve) => cAlice.once('campaign:tokens:update', resolve));
         let ack = await new Promise((r) => cGm.emit('campaign:tokens:add', {

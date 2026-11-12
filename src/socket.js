@@ -22,6 +22,7 @@ const User = require('./models/User');
 const ChatMessage = require('./models/ChatMessage');
 const Character = require('./models/Character');
 const MapTokens = require('./models/MapTokens');
+const MapModel = require('./models/Map');
 const MapLighting = require('./models/MapLighting');
 const Initiative = require('./models/Initiative');
 const Inventory = require('./models/Inventory');
@@ -138,11 +139,91 @@ async function loadMapTokens(campaignId, mapId) {
     return doc;
 }
 
+// ---- Live-Spielmodus (Runde 4a) ----
+// Jedes Token belegt genau EIN Rasterfeld. Feld = (Math.round(x), Math.round(y)).
+// Felder von Tokens, die gerade bewegt werden, zaehlen beim Zielabgleich NICHT als besetzt.
+function tokenFieldKey(t) {
+    return `${Math.round(t.x)},${Math.round(t.y)}`;
+}
+
+// Welt-Dimension der Karte in Feldern. Bei 2d-editor direkt aus doc.width/height.
+// Bei 2d-image waere das Image-Pixel/cellPx — ohne gespeicherte Image-Groesse
+// unbekannt. Deshalb Fallback: 20x20 Felder, Startfeld (10,10). Reicht fuers
+// Auto-Anlegen, weil wir spiralfoermig suchen.
+function worldDimsForMap(map) {
+    if (!map) return { w: 20, h: 20 };
+    if (map.kind === '2d-editor' && map.doc && Number.isFinite(map.doc.width) && Number.isFinite(map.doc.height)) {
+        return { w: Math.max(1, Math.round(map.doc.width)), h: Math.max(1, Math.round(map.doc.height)) };
+    }
+    return { w: 20, h: 20 };
+}
+
+// Spiralsuche ab (cx,cy): naechstes freies Feld (nicht von Tokens besetzt, innerhalb 0..w-1 / 0..h-1).
+// Wenn alles belegt ist, Rueckgabe (cx,cy) (dann liegen Tokens notfalls uebereinander — Spec:
+// bestehende Overlaps erlauben wir, erste freie Position wird geprueft).
+function findFreeField(tokens, worldW, worldH, cx, cy) {
+    const occupied = new Set(tokens.map((t) => tokenFieldKey(t)));
+    const inWorld = (x, y) => x >= 0 && y >= 0 && x < worldW && y < worldH;
+    const sx = Math.max(0, Math.min(worldW - 1, Math.round(cx)));
+    const sy = Math.max(0, Math.min(worldH - 1, Math.round(cy)));
+    if (inWorld(sx, sy) && !occupied.has(`${sx},${sy}`)) return { x: sx, y: sy };
+    // Spiral-Walk (rings around (sx,sy)).
+    const maxR = Math.max(worldW, worldH);
+    for (let r = 1; r <= maxR; r++) {
+        for (let dx = -r; dx <= r; dx++) {
+            for (let dy = -r; dy <= r; dy++) {
+                if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue;
+                const x = sx + dx, y = sy + dy;
+                if (!inWorld(x, y)) continue;
+                if (!occupied.has(`${x},${y}`)) return { x, y };
+            }
+        }
+    }
+    return { x: sx, y: sy };
+}
+
+// Idempotent: existiert fuer diesen Spieler schon ein Token auf der Karte, nichts tun.
+// Sonst anlegen und doc.save + Rueckgabe {doc, created}. Nutzt characterSelection als
+// visuelles Default (characterId + ownerUserId), sonst nur ownerUserId + Kuerzel.
+async function ensureAutoTokenForPlayer({ campaign, mapId, userId }) {
+    const map = await MapModel.findById(mapId);
+    const doc = await loadMapTokens(campaign._id, mapId);
+    const already = doc.tokens.some((t) => String(t.ownerUserId || '') === String(userId));
+    if (already) return { doc, created: null };
+    const dims = worldDimsForMap(map);
+    const spot = findFreeField(doc.tokens, dims.w, dims.h, dims.w / 2, dims.h / 2);
+    // Char fuer visuelles Default aus Campaign.characterSelections.
+    let charId = null;
+    try {
+        if (campaign.characterSelections?.get) {
+            charId = campaign.characterSelections.get(String(userId)) || null;
+        }
+    } catch {}
+    if (charId && !mongoose.Types.ObjectId.isValid(String(charId))) charId = null;
+    const token = {
+        id: `tok-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        characterId: charId ? new mongoose.Types.ObjectId(String(charId)) : null,
+        ownerUserId: new mongoose.Types.ObjectId(String(userId)),
+        label: '',
+        color: '#9b2a1e',
+        x: spot.x,
+        y: spot.y,
+        size: 1,
+        groupId: null,
+        locked: false,
+    };
+    doc.tokens.push(token);
+    doc.markModified('tokens');
+    await doc.save();
+    return { doc, created: token };
+}
+
 function sanitizeTokenForAdd(raw) {
     if (!raw || typeof raw !== 'object') return null;
     const x = Number(raw.x), y = Number(raw.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-    const size = Number.isFinite(raw.size) && raw.size >= 0.25 && raw.size <= 10 ? raw.size : 1;
+    // Runde 4a: Tokens belegen genau 1 Feld. Client-seitige Groesse wird ignoriert.
+    const size = 1;
     const id = typeof raw.id === 'string' && raw.id.length > 0 && raw.id.length <= 64
         ? raw.id : `tok-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     return {
@@ -226,6 +307,24 @@ function attach(io) {
                         campaignId,
                         userId: socket.userId,
                     });
+                }
+                // Runde 4a: Spieler bekommt AUTOMATISCH ein Token auf der aktiven
+                // Karte (idempotent). GM = kein Token. activeMap muss in der
+                // Kampagne eingetragen sein (ist sie von Natur aus, weil wir das
+                // in setActiveMap pruefen).
+                try {
+                    if (info.role === 'player' && info.campaign.activeMapId) {
+                        const { doc, created } = await ensureAutoTokenForPlayer({
+                            campaign: info.campaign,
+                            mapId: info.campaign.activeMapId,
+                            userId: socket.userId,
+                        });
+                        if (created) {
+                            broadcastTokens(info.campaign._id, info.campaign.activeMapId, doc);
+                        }
+                    }
+                } catch (err) {
+                    console.error('auto-token on join error:', err);
                 }
             } catch (e) {
                 console.error('campaign:join error:', e);
@@ -334,6 +433,34 @@ function attach(io) {
                     campaignId: String(campaignId),
                     activeMapId: campaign.activeMapId ? String(campaign.activeMapId) : null,
                 });
+                // Runde 4a: Fuer jeden Spieler, der im Raum ist, Token auf der neuen
+                // Karte sicherstellen (idempotent, GM selbst bekommt nichts).
+                if (mapId) {
+                    const roomSet = io.sockets.adapter.rooms.get(`campaign:${campaignId}`);
+                    if (roomSet) {
+                        const seenUsers = new Set();
+                        for (const sid of roomSet) {
+                            const s = io.sockets.sockets.get(sid);
+                            if (!s || !s.userId) continue;
+                            if (seenUsers.has(String(s.userId))) continue;
+                            seenUsers.add(String(s.userId));
+                            if (String(s.userId) === String(campaign.owner)) continue;
+                            // User muss Mitglied sein, nur dann auto-add.
+                            const isMember = (campaign.players || []).some(
+                                (p) => String(p) === String(s.userId)
+                            );
+                            if (!isMember) continue;
+                            try {
+                                const { doc, created } = await ensureAutoTokenForPlayer({
+                                    campaign, mapId, userId: s.userId,
+                                });
+                                if (created) broadcastTokens(campaignId, mapId, doc);
+                            } catch (err) {
+                                console.error('auto-token on setActiveMap error:', err);
+                            }
+                        }
+                    }
+                }
                 if (typeof ack === 'function') ack({ ok: true });
             } catch (e) {
                 console.error('campaign:setActiveMap error:', e);
@@ -404,6 +531,19 @@ function attach(io) {
                 if (ctx.doc.tokens.some((t) => t.id === clean.id)) {
                     clean.id = `tok-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
                 }
+                // Runde 4a: Position auf Feldmitte snappen und bei Besetzung ein freies
+                // Nachbarfeld finden. Welt-Dim aus der Karte (fuer 2d-image: 20x20 Fallback,
+                // reicht fuer die Spiralsuche — Zielfeld ist nahe am Wunsch).
+                try {
+                    const mapDoc = await MapModel.findById(mapId);
+                    const dims = worldDimsForMap(mapDoc);
+                    const spot = findFreeField(ctx.doc.tokens, dims.w, dims.h, clean.x, clean.y);
+                    clean.x = spot.x;
+                    clean.y = spot.y;
+                } catch {
+                    clean.x = Math.round(clean.x);
+                    clean.y = Math.round(clean.y);
+                }
                 ctx.doc.tokens.push(clean);
                 await ctx.doc.save();
                 broadcastTokens(campaignId, mapId, ctx.doc);
@@ -462,6 +602,14 @@ function attach(io) {
         });
 
         // Loslassen -> persistieren und broadcast final state.
+        //
+        // Runde 4a:
+        //  - Position snappt auf Feldmitte (Math.round).
+        //  - Ein Feld darf nur ein Token belegen. Felder von Tokens, die gerade in
+        //    diesem Drop-Batch BEWEGT werden, zaehlen als frei (Gruppentausch).
+        //  - Wenn irgendein Zielfeld belegt ist, wird der GESAMTE Drop abgelehnt
+        //    (ack.ok=false) — der Client muss alle beteiligten Tokens zuruecksetzen.
+        //  - GM darf auch gelockte Tokens bewegen.
         socket.on('campaign:tokens:drop', async ({ campaignId, mapId, updates } = {}, ack) => {
             try {
                 const ctx = await withRoom(campaignId, mapId, false, ack);
@@ -472,7 +620,8 @@ function attach(io) {
                 }
                 const groupsById = new Map(ctx.doc.groups.map((g) => [g.id, g]));
                 const tokensById = new Map(ctx.doc.tokens.map((t) => [t.id, t]));
-                let changed = 0;
+                // 1) Permission-Filter + Snap
+                const candidates = [];
                 for (const u of updates) {
                     if (!u || typeof u !== 'object') continue;
                     const t = tokensById.get(u.id);
@@ -481,15 +630,53 @@ function attach(io) {
                     if (ctx.info.role !== 'owner') {
                         if (!playerCanMoveToken(t, ctx.doc.tokens, groupsById, socket.userId)) continue;
                     }
-                    t.x = u.x; t.y = u.y;
-                    changed++;
+                    candidates.push({
+                        id: u.id,
+                        t,
+                        nx: Math.round(u.x),
+                        ny: Math.round(u.y),
+                    });
                 }
-                if (changed > 0) {
-                    ctx.doc.markModified('tokens');
-                    await ctx.doc.save();
-                    broadcastTokens(campaignId, mapId, ctx.doc);
+                if (candidates.length === 0) {
+                    if (typeof ack === 'function') ack({ ok: true, changed: 0 });
+                    return;
                 }
-                if (typeof ack === 'function') ack({ ok: true, changed });
+                // 2) Kollisionsvorab-Check (Runde 4a).
+                const movingIds = new Set(candidates.map((c) => c.id));
+                const occupied = new Set();
+                for (const t of ctx.doc.tokens) {
+                    if (movingIds.has(t.id)) continue;
+                    occupied.add(`${Math.round(t.x)},${Math.round(t.y)}`);
+                }
+                const targetCells = new Map(); // "x,y" -> id
+                const rejected = [];
+                for (const c of candidates) {
+                    const key = `${c.nx},${c.ny}`;
+                    if (occupied.has(key) || targetCells.has(key)) {
+                        rejected.push(c.id);
+                    } else {
+                        targetCells.set(key, c.id);
+                    }
+                }
+                if (rejected.length > 0) {
+                    // Ganzer Drop wird verworfen (Spec: "ganzer Zug abgelehnt").
+                    if (typeof ack === 'function') ack({
+                        ok: false,
+                        msg: 'cell occupied',
+                        rejectedIds: rejected,
+                        tokenIds: candidates.map((c) => c.id),
+                    });
+                    return;
+                }
+                // 3) Anwenden + broadcast.
+                for (const c of candidates) {
+                    c.t.x = c.nx;
+                    c.t.y = c.ny;
+                }
+                ctx.doc.markModified('tokens');
+                await ctx.doc.save();
+                broadcastTokens(campaignId, mapId, ctx.doc);
+                if (typeof ack === 'function') ack({ ok: true, changed: candidates.length });
             } catch (e) {
                 console.error('tokens:drop error', e);
                 if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
