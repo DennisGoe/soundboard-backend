@@ -7,6 +7,8 @@ const ChatMessage = require('../models/ChatMessage');
 const Character = require('../models/Character');
 const MapTokens = require('../models/MapTokens');
 const MapLighting = require('../models/MapLighting');
+const Initiative = require('../models/Initiative');
+const Inventory = require('../models/Inventory');
 const { authMiddleware } = require('../authMiddleware');
 
 const router = express.Router();
@@ -491,6 +493,106 @@ router.get('/:id/maps/:mapId/lighting', async (req, res) => {
         });
     } catch (err) {
         console.error('Error loading lighting:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// ---------- Initiative ----------
+
+// GET /api/campaigns/:id/initiative -> aktueller Tracker. Legt leer an, falls noch nicht vorhanden.
+router.get('/:id/initiative', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(404).json({ msg: 'Not found' });
+    try {
+        const userId = req.user.id;
+        const campaign = await Campaign.findById(id);
+        if (!campaign || !roleFor(campaign, userId)) {
+            return res.status(404).json({ msg: 'Not found' });
+        }
+        const doc = await Initiative.findOneAndUpdate(
+            { campaignId: id },
+            { $setOnInsert: { campaignId: id, active: false, round: 1, turnIndex: 0, entries: [], orderCounter: 0 } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        res.json({
+            initiative: {
+                active: doc.active, round: doc.round, turnIndex: doc.turnIndex,
+                entries: doc.entries,
+            },
+        });
+    } catch (err) {
+        console.error('Error loading initiative:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// ---------- Inventar ----------
+
+// GET /api/campaigns/:id/inventory  -> das eigene Inventar.
+router.get('/:id/inventory', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(404).json({ msg: 'Not found' });
+    try {
+        const userId = req.user.id;
+        const campaign = await Campaign.findById(id);
+        if (!campaign || !roleFor(campaign, userId)) {
+            return res.status(404).json({ msg: 'Not found' });
+        }
+        const doc = await Inventory.findOneAndUpdate(
+            { campaignId: id, userId },
+            { $setOnInsert: { campaignId: id, userId, notes: '', items: [] } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        res.json({ inventory: { userId: String(userId), notes: doc.notes, items: doc.items } });
+    } catch (err) {
+        console.error('Error loading inventory:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// GET /api/campaigns/:id/inventories -> alle Inventare (nur GM).
+router.get('/:id/inventories', async (req, res) => {
+    const { id } = req.params;
+    if (!isValidId(id)) return res.status(404).json({ msg: 'Not found' });
+    try {
+        const userId = req.user.id;
+        const campaign = await Campaign.findById(id);
+        if (!campaign) return res.status(404).json({ msg: 'Not found' });
+        if (String(campaign.owner) !== String(userId)) {
+            return res.status(403).json({ msg: 'Not allowed' });
+        }
+        const docs = await Inventory.find({ campaignId: id });
+        // Pro Spieler (+ Owner) sicherstellen, dass es ein Doc gibt — macht
+        // das UI einfacher. Fehlende Inventare on-the-fly ergaenzen.
+        const seen = new Set(docs.map((d) => String(d.userId)));
+        const ensureIds = [String(campaign.owner), ...(campaign.players || []).map((p) => String(p))];
+        const toCreate = ensureIds.filter((uid) => !seen.has(uid));
+        for (const uid of toCreate) {
+            // Race-sicher: wenn parallel schon via Socket upsertet, nimm den vorhandenen.
+            const d = await Inventory.findOneAndUpdate(
+                { campaignId: id, userId: uid },
+                { $setOnInsert: { campaignId: id, userId: uid, notes: '', items: [] } },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
+            docs.push(d);
+        }
+        // Usernames fuer Darstellung mitgeben. Achtung: `Map` am Dateikopf
+        // ist die Mongoose-Model-Klasse — wir nutzen hier den globalen
+        // Konstruktor (global.Map).
+        const userIds = docs.map((d) => d.userId);
+        const users = await User.find({ _id: { $in: userIds } })
+            .select('_id username');
+        const nameById = new global.Map(users.map((u) => [String(u._id), u.username]));
+        res.json({
+            inventories: docs.map((d) => ({
+                userId: String(d.userId),
+                username: nameById.get(String(d.userId)) || '?',
+                notes: d.notes,
+                items: d.items,
+            })),
+        });
+    } catch (err) {
+        console.error('Error loading inventories:', err);
         res.status(500).json({ msg: 'Server error' });
     }
 });

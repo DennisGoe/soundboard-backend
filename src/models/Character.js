@@ -24,6 +24,14 @@ const CharacterSchema = new mongoose.Schema(
             type: String,
             default: null,
         },
+        // Initiative-Bonus fuer d20-Wurf. Kann negativ sein (Monk mit 0?
+        // Eher ungewoehnlich, aber -5..+30 reicht locker).
+        initiativeBonus: {
+            type: Number,
+            default: 0,
+            min: -10,
+            max: 30,
+        },
     },
     { timestamps: true }
 );

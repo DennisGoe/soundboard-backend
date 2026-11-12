@@ -23,6 +23,8 @@ const ChatMessage = require('./models/ChatMessage');
 const Character = require('./models/Character');
 const MapTokens = require('./models/MapTokens');
 const MapLighting = require('./models/MapLighting');
+const Initiative = require('./models/Initiative');
+const Inventory = require('./models/Inventory');
 const {
     applyFogOps,
     ensureFogDims,
@@ -30,6 +32,10 @@ const {
     MAX_LIGHTS,
     emptyBits,
 } = require('./lightingOps');
+const {
+    applySort, rollD20, newEntryId, sanitizeEntryPatch,
+    sanitizeItemInput, newItemId,
+} = require('./combatOps');
 
 function parseToken(socket) {
     const raw =
@@ -823,6 +829,735 @@ function attach(io) {
                 if (typeof ack === 'function') ack({ ok: true });
             } catch (e) {
                 console.error('tokens:ungroup error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // ---------- Initiative ----------
+
+        async function loadInitiative(campaignId) {
+            return Initiative.findOneAndUpdate(
+                { campaignId },
+                { $setOnInsert: { campaignId, active: false, round: 1, turnIndex: 0, entries: [], orderCounter: 0 } },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
+        }
+
+        function broadcastInitiative(campaignId, doc) {
+            io.to(`campaign:${campaignId}`).emit('campaign:initiative:update', {
+                campaignId: String(campaignId),
+                initiative: {
+                    active: doc.active, round: doc.round, turnIndex: doc.turnIndex,
+                    entries: doc.entries,
+                },
+            });
+        }
+
+        // Postet eine System-Chat-Nachricht fuer Wuerfe & Rundenwechsel.
+        async function postSystemChat(campaignId, text) {
+            try {
+                const msg = await ChatMessage.create({
+                    campaignId,
+                    userId: new mongoose.Types.ObjectId(),  // kein echter User
+                    username: 'System',
+                    text: text.slice(0, 2000),
+                });
+                io.to(`campaign:${campaignId}`).emit('campaign:chat', {
+                    _id: String(msg._id),
+                    userId: String(msg.userId),
+                    username: msg.username,
+                    text: msg.text,
+                    createdAt: msg.createdAt,
+                    campaignId: String(campaignId),
+                });
+            } catch (e) {
+                console.error('system chat error', e);
+            }
+        }
+
+        socket.on('campaign:initiative:get', async ({ campaignId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                if (typeof ack === 'function') ack({
+                    ok: true,
+                    initiative: {
+                        active: doc.active, round: doc.round, turnIndex: doc.turnIndex,
+                        entries: doc.entries,
+                    },
+                });
+            } catch (e) {
+                console.error('initiative:get error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Spieler (und GM) wuerfeln fuer SICH. Server wuerfelt (kein Client-Wert vertrauen).
+        // Nimmt bonusOverride wenn gesetzt, sonst Char.initiativeBonus, sonst 0.
+        // Wenn der Entry schon existiert (selbe userId + characterId), wird sein
+        // Wurf UEBERSCHRIEBEN (nicht gestapelt).
+        socket.on('campaign:initiative:roll', async ({ campaignId, characterId, bonusOverride } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                // Charakter laden (optional). Wenn gesetzt, muss der User Owner sein.
+                let char = null;
+                if (characterId) {
+                    if (!isValidId(characterId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'character invalid' });
+                        return;
+                    }
+                    char = await Character.findById(characterId);
+                    if (!char || String(char.owner) !== String(socket.userId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'character not yours' });
+                        return;
+                    }
+                }
+                // Fallback: aus Campaign.characterSelections ermitteln.
+                if (!char) {
+                    const sel = info.campaign.characterSelections?.get?.(String(socket.userId));
+                    if (sel) {
+                        char = await Character.findById(sel);
+                        if (char && String(char.owner) !== String(socket.userId)) char = null;
+                    }
+                }
+                let bonus;
+                if (bonusOverride !== undefined && bonusOverride !== null) {
+                    const b = Number(bonusOverride);
+                    if (!Number.isFinite(b) || b < -10 || b > 30) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'bonus invalid' });
+                        return;
+                    }
+                    bonus = Math.round(b);
+                } else {
+                    bonus = char?.initiativeBonus ?? 0;
+                }
+                const roll = rollD20();
+                const user = await User.findById(socket.userId).select('username');
+                const username = user?.username || 'Unbekannt';
+                const name = char?.name || username;
+                const tokenUrl = char?.tokenUrl || null;
+
+                const doc = await loadInitiative(campaignId);
+                // Vorhandenen Eintrag suchen (selbe userId + characterId-Identitaet).
+                let entry = doc.entries.find((e) =>
+                    String(e.userId || '') === String(socket.userId) &&
+                    String(e.characterId || '') === String(characterId || '')
+                );
+                doc.orderCounter = (doc.orderCounter || 0) + 1;
+                if (entry) {
+                    entry.roll = roll;
+                    entry.bonus = bonus;
+                    entry.name = name;
+                    entry.tokenUrl = tokenUrl;
+                    entry.order = doc.orderCounter;
+                } else {
+                    entry = {
+                        id: newEntryId(),
+                        userId: socket.userId,
+                        characterId: characterId || null,
+                        isNpc: false,
+                        name,
+                        tokenUrl,
+                        roll,
+                        bonus,
+                        order: doc.orderCounter,
+                    };
+                    doc.entries.push(entry);
+                }
+                applySort(doc);
+                doc.markModified('entries');
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                const total = roll + bonus;
+                const signed = bonus >= 0 ? `+${bonus}` : `${bonus}`;
+                await postSystemChat(campaignId, `🎲 ${name} würfelt Initiative: ${roll} ${signed} = ${total}`);
+                if (typeof ack === 'function') ack({ ok: true, roll, bonus, total });
+            } catch (e) {
+                console.error('initiative:roll error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM legt NSC/Monster-Entry an. { name, bonus?, roll? }. Fehlt roll, wird
+        // sofort gewuerfelt (sonst kennt GM das Monster schon).
+        socket.on('campaign:initiative:addNpc', async ({ campaignId, name, bonus, roll } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                if (typeof name !== 'string' || name.trim().length === 0 || name.length > 80) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'name required' });
+                    return;
+                }
+                const b = Number(bonus ?? 0);
+                if (!Number.isFinite(b) || b < -10 || b > 30) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'bonus invalid' });
+                    return;
+                }
+                let r = null;
+                if (roll !== undefined && roll !== null) {
+                    const n = Number(roll);
+                    if (!Number.isFinite(n) || n < 1 || n > 20) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'roll invalid' });
+                        return;
+                    }
+                    r = Math.round(n);
+                } else {
+                    r = rollD20();
+                }
+                const doc = await loadInitiative(campaignId);
+                doc.orderCounter = (doc.orderCounter || 0) + 1;
+                const entry = {
+                    id: newEntryId(),
+                    userId: null,
+                    characterId: null,
+                    isNpc: true,
+                    name: name.trim(),
+                    tokenUrl: null,
+                    roll: r,
+                    bonus: Math.round(b),
+                    order: doc.orderCounter,
+                };
+                doc.entries.push(entry);
+                applySort(doc);
+                doc.markModified('entries');
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                const total = r + Math.round(b);
+                const signed = b >= 0 ? `+${Math.round(b)}` : `${Math.round(b)}`;
+                await postSystemChat(campaignId, `🎲 ${entry.name} (NSC) würfelt Initiative: ${r} ${signed} = ${total}`);
+                if (typeof ack === 'function') ack({ ok: true, entry });
+            } catch (e) {
+                console.error('initiative:addNpc error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Wurf oder Bonus eines Entrys korrigieren.
+        socket.on('campaign:initiative:update', async ({ campaignId, entryId, patch } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                const e = doc.entries.find((x) => x.id === entryId);
+                if (!e) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'not found' });
+                    return;
+                }
+                const clean = sanitizeEntryPatch(patch);
+                Object.assign(e, clean);
+                applySort(doc);
+                doc.markModified('entries');
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('initiative:update error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Entry entfernen.
+        socket.on('campaign:initiative:remove', async ({ campaignId, entryId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                const before = doc.entries.length;
+                doc.entries = doc.entries.filter((x) => x.id !== entryId);
+                if (doc.entries.length === before) {
+                    if (typeof ack === 'function') ack({ ok: true });
+                    return;
+                }
+                applySort(doc);
+                if (doc.turnIndex >= doc.entries.length) doc.turnIndex = 0;
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('initiative:remove error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Kampf starten (active=true), zuruecksetzen auf Runde 1, TurnIndex 0.
+        socket.on('campaign:initiative:start', async ({ campaignId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                applySort(doc);
+                doc.active = true;
+                doc.round = 1;
+                doc.turnIndex = 0;
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                await postSystemChat(campaignId, `⚔ Kampf beginnt — Runde 1`);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('initiative:start error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Kampf beenden. Entries bleiben erhalten, bis "reset".
+        socket.on('campaign:initiative:end', async ({ campaignId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                doc.active = false;
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                await postSystemChat(campaignId, `⚔ Kampf beendet`);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('initiative:end error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Zug weiterschalten. Am Ende der Liste: Runde+1.
+        socket.on('campaign:initiative:next', async ({ campaignId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                if (doc.entries.length === 0) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'empty' });
+                    return;
+                }
+                doc.turnIndex += 1;
+                if (doc.turnIndex >= doc.entries.length) {
+                    doc.turnIndex = 0;
+                    doc.round += 1;
+                    await doc.save();
+                    broadcastInitiative(campaignId, doc);
+                    await postSystemChat(campaignId, `⌛ Runde ${doc.round} beginnt`);
+                } else {
+                    await doc.save();
+                    broadcastInitiative(campaignId, doc);
+                }
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('initiative:next error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM: Alles leeren.
+        socket.on('campaign:initiative:reset', async ({ campaignId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadInitiative(campaignId);
+                doc.entries = [];
+                doc.active = false;
+                doc.round = 1;
+                doc.turnIndex = 0;
+                doc.orderCounter = 0;
+                await doc.save();
+                broadcastInitiative(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('initiative:reset error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // ---------- Inventar ----------
+
+        async function loadInventory(campaignId, userId) {
+            return Inventory.findOneAndUpdate(
+                { campaignId, userId },
+                { $setOnInsert: { campaignId, userId, notes: '', items: [] } },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
+        }
+
+        // Pusht ein geaendertes Inventar an:
+        //   - den Owner-User (per userId-"Zone": alle Sockets dieses Users im Raum)
+        //   - den GM (owner der Kampagne)
+        // socket.io hat keine User-Raeume per-se; wir broadcasten an den
+        // Campaign-Room, aber der Payload enthaelt den userId; FE filtert.
+        //
+        // Das ist OK, weil die Daten nur betroffene User zeigen (Spieler sieht
+        // nichts von anderen; FE blendet das aus). Falls Spieler den Payload im
+        // Netzwerk mitlesen koennen, waere das ein Problem — deshalb pushen wir
+        // NUR gezielt pro Sockets.
+        async function pushInventoryTo(campaignId, inventory) {
+            const campaign = await Campaign.findById(campaignId).select('owner players');
+            if (!campaign) return;
+            const targets = new Set([
+                String(campaign.owner),
+                String(inventory.userId),
+            ]);
+            const payload = {
+                campaignId: String(campaignId),
+                inventory: {
+                    userId: String(inventory.userId),
+                    notes: inventory.notes,
+                    items: inventory.items,
+                },
+            };
+            // Alle Sockets im Campaign-Raum durchgehen, nur Zielusers pushen.
+            const room = io.sockets.adapter.rooms.get(`campaign:${campaignId}`);
+            if (!room) return;
+            for (const sid of room) {
+                const s = io.sockets.sockets.get(sid);
+                if (!s) continue;
+                if (targets.has(String(s.userId))) {
+                    s.emit('campaign:inventory:update', payload);
+                }
+            }
+        }
+
+        // GET fuer sich selbst (jeder) ODER fuer einen fremden User (nur GM).
+        socket.on('campaign:inventory:get', async ({ campaignId, targetUserId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                let target = socket.userId;
+                if (targetUserId && String(targetUserId) !== String(socket.userId)) {
+                    if (info.role !== 'owner') {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                    if (!isValidId(targetUserId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'target invalid' });
+                        return;
+                    }
+                    target = targetUserId;
+                }
+                const doc = await loadInventory(campaignId, target);
+                if (typeof ack === 'function') ack({
+                    ok: true,
+                    inventory: {
+                        userId: String(target),
+                        notes: doc.notes, items: doc.items,
+                    },
+                });
+            } catch (e) {
+                console.error('inventory:get error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Notizen setzen (Spieler fuer sich selbst, GM fuer beliebigen User).
+        socket.on('campaign:inventory:setNotes', async ({ campaignId, targetUserId, notes } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                let target = socket.userId;
+                if (targetUserId && String(targetUserId) !== String(socket.userId)) {
+                    if (info.role !== 'owner') {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                    if (!isValidId(targetUserId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'target invalid' });
+                        return;
+                    }
+                    target = targetUserId;
+                }
+                if (typeof notes !== 'string' || notes.length > 8000) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'notes invalid' });
+                    return;
+                }
+                const doc = await loadInventory(campaignId, target);
+                doc.notes = notes;
+                await doc.save();
+                await pushInventoryTo(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('inventory:setNotes error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Item hinzufuegen (Spieler fuer sich, GM fuer beliebigen User).
+        socket.on('campaign:inventory:addItem', async ({ campaignId, targetUserId, item } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                let target = socket.userId;
+                if (targetUserId && String(targetUserId) !== String(socket.userId)) {
+                    if (info.role !== 'owner') {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                    if (!isValidId(targetUserId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'target invalid' });
+                        return;
+                    }
+                    target = targetUserId;
+                }
+                const clean = sanitizeItemInput(item);
+                if (!clean) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'item invalid' });
+                    return;
+                }
+                const doc = await loadInventory(campaignId, target);
+                if (doc.items.length >= 500) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'too many items' });
+                    return;
+                }
+                const entry = { id: newItemId(), ...clean };
+                doc.items.push(entry);
+                doc.markModified('items');
+                await doc.save();
+                await pushInventoryTo(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true, item: entry });
+            } catch (e) {
+                console.error('inventory:addItem error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Item aktualisieren.
+        socket.on('campaign:inventory:updateItem', async ({ campaignId, targetUserId, itemId, patch } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                let target = socket.userId;
+                if (targetUserId && String(targetUserId) !== String(socket.userId)) {
+                    if (info.role !== 'owner') {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                    if (!isValidId(targetUserId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'target invalid' });
+                        return;
+                    }
+                    target = targetUserId;
+                }
+                const doc = await loadInventory(campaignId, target);
+                const it = doc.items.find((x) => x.id === itemId);
+                if (!it) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'not found' });
+                    return;
+                }
+                if (patch && typeof patch === 'object') {
+                    if (typeof patch.name === 'string') {
+                        const n = patch.name.trim();
+                        if (n.length > 0 && n.length <= 120) it.name = n;
+                    }
+                    if (patch.qty !== undefined) {
+                        const q = Number(patch.qty);
+                        if (Number.isFinite(q) && q >= 1 && q <= 99999) it.qty = Math.round(q);
+                    }
+                    if (typeof patch.description === 'string') {
+                        it.description = patch.description.slice(0, 2000);
+                    }
+                }
+                doc.markModified('items');
+                await doc.save();
+                await pushInventoryTo(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('inventory:updateItem error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Item loeschen.
+        socket.on('campaign:inventory:removeItem', async ({ campaignId, targetUserId, itemId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                let target = socket.userId;
+                if (targetUserId && String(targetUserId) !== String(socket.userId)) {
+                    if (info.role !== 'owner') {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                    if (!isValidId(targetUserId)) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'target invalid' });
+                        return;
+                    }
+                    target = targetUserId;
+                }
+                const doc = await loadInventory(campaignId, target);
+                doc.items = doc.items.filter((x) => x.id !== itemId);
+                doc.markModified('items');
+                await doc.save();
+                await pushInventoryTo(campaignId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('inventory:removeItem error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Transfer: Teil- oder Komplettmenge eines Items von A nach B (nur GM).
+        // { fromUserId, toUserId, itemId, qty }. Wenn qty >= item.qty -> ganzes
+        // Item geht ueber. Wenn <, splittet qty ab und reduziert Original.
+        socket.on('campaign:inventory:transfer', async ({ campaignId, fromUserId, toUserId, itemId, qty } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info || info.role !== 'owner') {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                if (!isValidId(fromUserId) || !isValidId(toUserId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'users invalid' });
+                    return;
+                }
+                if (String(fromUserId) === String(toUserId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'same user' });
+                    return;
+                }
+                // Beide User muessen Mitglied sein (owner oder player).
+                const members = new Set([
+                    String(info.campaign.owner),
+                    ...(info.campaign.players || []).map((p) => String(p)),
+                ]);
+                if (!members.has(String(fromUserId)) || !members.has(String(toUserId))) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'user not in campaign' });
+                    return;
+                }
+                const q = Number(qty);
+                if (!Number.isFinite(q) || q <= 0) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'qty invalid' });
+                    return;
+                }
+                const fromDoc = await loadInventory(campaignId, fromUserId);
+                const it = fromDoc.items.find((x) => x.id === itemId);
+                if (!it) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'item not found' });
+                    return;
+                }
+                const take = Math.min(it.qty, Math.round(q));
+                const toDoc = await loadInventory(campaignId, toUserId);
+                // Falls Ziel ein Item gleichen Namens+description hat, stapeln; sonst neu.
+                const existing = toDoc.items.find((x) =>
+                    x.name === it.name && (x.description || '') === (it.description || '')
+                );
+                if (existing) {
+                    existing.qty = Math.min(99999, existing.qty + take);
+                } else {
+                    toDoc.items.push({
+                        id: newItemId(),
+                        name: it.name, qty: take, description: it.description || '',
+                    });
+                }
+                if (take >= it.qty) {
+                    fromDoc.items = fromDoc.items.filter((x) => x.id !== it.id);
+                } else {
+                    it.qty = it.qty - take;
+                }
+                fromDoc.markModified('items');
+                toDoc.markModified('items');
+                await fromDoc.save();
+                await toDoc.save();
+                await pushInventoryTo(campaignId, fromDoc);
+                await pushInventoryTo(campaignId, toDoc);
+                if (typeof ack === 'function') ack({ ok: true, taken: take });
+            } catch (e) {
+                console.error('inventory:transfer error', e);
                 if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
             }
         });

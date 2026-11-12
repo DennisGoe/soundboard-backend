@@ -33,12 +33,27 @@ router.get('/', async (req, res) => {
     }
 });
 
-// POST /api/characters  { name } -> neu, ohne Token-Bild.
+function sanitizeBonus(raw) {
+    if (raw === undefined || raw === null) return undefined;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    const i = Math.round(n);
+    if (i < -10 || i > 30) return null;
+    return i;
+}
+
+// POST /api/characters  { name, initiativeBonus? } -> neu, ohne Token-Bild.
 router.post('/', async (req, res) => {
     try {
         const name = sanitizeName(req.body?.name);
         if (!name) return res.status(400).json({ msg: 'Name required (1-80 chars)' });
-        const c = await Character.create({ owner: req.user.id, name, tokenUrl: null });
+        const payload = { owner: req.user.id, name, tokenUrl: null };
+        if (req.body?.initiativeBonus !== undefined) {
+            const b = sanitizeBonus(req.body.initiativeBonus);
+            if (b === null) return res.status(400).json({ msg: 'initiativeBonus invalid (-10..30)' });
+            if (b !== undefined) payload.initiativeBonus = b;
+        }
+        const c = await Character.create(payload);
         res.status(201).json({ character: c });
     } catch (err) {
         console.error('Error creating character:', err);
@@ -46,7 +61,7 @@ router.post('/', async (req, res) => {
     }
 });
 
-// PUT /api/characters/:id  { name } -> nur Owner.
+// PUT /api/characters/:id  { name?, initiativeBonus? } -> nur Owner.
 router.put('/:id', async (req, res) => {
     const { id } = req.params;
     if (!isValidId(id)) return res.status(404).json({ msg: 'Not found' });
@@ -59,6 +74,11 @@ router.put('/:id', async (req, res) => {
             const name = sanitizeName(req.body.name);
             if (!name) return res.status(400).json({ msg: 'Name required (1-80 chars)' });
             c.name = name;
+        }
+        if (req.body?.initiativeBonus !== undefined) {
+            const b = sanitizeBonus(req.body.initiativeBonus);
+            if (b === null) return res.status(400).json({ msg: 'initiativeBonus invalid (-10..30)' });
+            if (b !== undefined) c.initiativeBonus = b;
         }
         await c.save();
         res.json({ character: c });
