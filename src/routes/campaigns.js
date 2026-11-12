@@ -6,6 +6,7 @@ const User = require('../models/User');
 const ChatMessage = require('../models/ChatMessage');
 const Character = require('../models/Character');
 const MapTokens = require('../models/MapTokens');
+const MapLighting = require('../models/MapLighting');
 const { authMiddleware } = require('../authMiddleware');
 
 const router = express.Router();
@@ -459,6 +460,37 @@ router.get('/:id/maps/:mapId/tokens', async (req, res) => {
         res.json({ tokens: doc.tokens, groups: doc.groups });
     } catch (err) {
         console.error('Error loading tokens:', err);
+        res.status(500).json({ msg: 'Server error' });
+    }
+});
+
+// GET /api/campaigns/:id/maps/:mapId/lighting
+// Initialer Lighting-Zustand (Nebel + Dunkelheit + Lichter). Live-Updates
+// danach via socket.
+router.get('/:id/maps/:mapId/lighting', async (req, res) => {
+    const { id, mapId } = req.params;
+    if (!isValidId(id) || !isValidId(mapId)) return res.status(404).json({ msg: 'Not found' });
+    try {
+        const userId = req.user.id;
+        const campaign = await Campaign.findById(id);
+        if (!campaign || !roleFor(campaign, userId)) {
+            return res.status(404).json({ msg: 'Not found' });
+        }
+        const assigned = (campaign.mapIds || []).some((m) => String(m) === String(mapId));
+        if (!assigned) return res.status(404).json({ msg: 'Map not in campaign' });
+        const doc = await MapLighting.findOneAndUpdate(
+            { campaignId: id, mapId },
+            { $setOnInsert: { campaignId: id, mapId, fogW: 0, fogH: 0, fogBits: '', darkness: false, lights: [] } },
+            { upsert: true, new: true, setDefaultsOnInsert: true }
+        );
+        res.json({
+            lighting: {
+                fogW: doc.fogW, fogH: doc.fogH, fogBits: doc.fogBits,
+                darkness: doc.darkness, lights: doc.lights,
+            },
+        });
+    } catch (err) {
+        console.error('Error loading lighting:', err);
         res.status(500).json({ msg: 'Server error' });
     }
 });

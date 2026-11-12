@@ -22,6 +22,14 @@ const User = require('./models/User');
 const ChatMessage = require('./models/ChatMessage');
 const Character = require('./models/Character');
 const MapTokens = require('./models/MapTokens');
+const MapLighting = require('./models/MapLighting');
+const {
+    applyFogOps,
+    ensureFogDims,
+    sanitizeLight,
+    MAX_LIGHTS,
+    emptyBits,
+} = require('./lightingOps');
 
 function parseToken(socket) {
     const raw =
@@ -547,6 +555,255 @@ function attach(io) {
                 if (typeof ack === 'function') ack({ ok: true, groupId: gid });
             } catch (e) {
                 console.error('tokens:group error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // --- Lighting (Nebel + Dunkelheit + Lichter) ---
+
+        async function loadLighting(campaignId, mapId) {
+            return MapLighting.findOneAndUpdate(
+                { campaignId, mapId },
+                { $setOnInsert: { campaignId, mapId, fogW: 0, fogH: 0, fogBits: '', darkness: false, lights: [] } },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
+        }
+
+        function broadcastLighting(campaignId, mapId, doc) {
+            io.to(`campaign:${campaignId}`).emit('campaign:lighting:update', {
+                campaignId: String(campaignId),
+                mapId: String(mapId),
+                lighting: {
+                    fogW: doc.fogW,
+                    fogH: doc.fogH,
+                    fogBits: doc.fogBits,
+                    darkness: doc.darkness,
+                    lights: doc.lights,
+                },
+            });
+        }
+
+        socket.on('campaign:lighting:get', async ({ campaignId, mapId } = {}, ack) => {
+            try {
+                const ctx = await withRoom(campaignId, mapId, false, ack);
+                if (!ctx) return;
+                const light = await loadLighting(campaignId, mapId);
+                if (typeof ack === 'function') ack({
+                    ok: true,
+                    lighting: {
+                        fogW: light.fogW, fogH: light.fogH, fogBits: light.fogBits,
+                        darkness: light.darkness, lights: light.lights,
+                    },
+                });
+            } catch (e) {
+                console.error('lighting:get error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM teilt dem Server die Fog-Dimensionen mit (zb aus activeEditorDoc.width/height).
+        // Setzt bei erstmaligem Aufruf die Maske auf "alles abgedeckt", sonst resized.
+        socket.on('campaign:lighting:ensureFog', async ({ campaignId, mapId, w, h } = {}, ack) => {
+            try {
+                const ctx = await withRoom(campaignId, mapId, true, ack);
+                if (!ctx) return;
+                const light = await loadLighting(campaignId, mapId);
+                const changed = ensureFogDims(light, w, h);
+                if (changed) {
+                    await light.save();
+                    broadcastLighting(campaignId, mapId, light);
+                }
+                if (typeof ack === 'function') ack({
+                    ok: true, fogW: light.fogW, fogH: light.fogH, fogBits: light.fogBits,
+                });
+            } catch (e) {
+                console.error('lighting:ensureFog error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM wendet Fog-Operationen an.
+        socket.on('campaign:lighting:fog', async ({ campaignId, mapId, ops } = {}, ack) => {
+            try {
+                const ctx = await withRoom(campaignId, mapId, true, ack);
+                if (!ctx) return;
+                const light = await loadLighting(campaignId, mapId);
+                const result = applyFogOps(light, ops);
+                if (!result.changed) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: result.msg || 'no change' });
+                    return;
+                }
+                await light.save();
+                broadcastLighting(campaignId, mapId, light);
+                if (typeof ack === 'function') ack({ ok: true, applied: result.applied });
+            } catch (e) {
+                console.error('lighting:fog error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // GM schaltet Dunkelheit an/aus.
+        socket.on('campaign:lighting:darkness', async ({ campaignId, mapId, on } = {}, ack) => {
+            try {
+                const ctx = await withRoom(campaignId, mapId, true, ack);
+                if (!ctx) return;
+                const light = await loadLighting(campaignId, mapId);
+                light.darkness = !!on;
+                await light.save();
+                broadcastLighting(campaignId, mapId, light);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('lighting:darkness error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        // Prueft: Darf dieser User (nicht GM) das Token-Licht berechtigen?
+        // Regel: Lichter sind zunaechst GM-Sache. Ein Spieler darf jedoch:
+        //   - ein neues Licht fuer sein eigenes Token hinzufuegen
+        //   - ein existierendes Licht zu seinem eigenen Token toggeln/aendern
+        async function canPlayerManageLight(campaignId, mapId, userId, light) {
+            if (light.kind !== 'token' || !light.tokenId) return false;
+            const tdoc = await MapTokens.findOne({ campaignId, mapId }).select('tokens');
+            const t = (tdoc?.tokens || []).find((x) => x.id === light.tokenId);
+            if (!t) return false;
+            return String(t.ownerUserId || '') === String(userId);
+        }
+
+        socket.on('campaign:lighting:light:add', async ({ campaignId, mapId, light } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId) || !isValidId(mapId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const assigned = (info.campaign.mapIds || []).some(
+                    (m) => String(m) === String(mapId)
+                );
+                if (!assigned) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'map not assigned' });
+                    return;
+                }
+                const doc = await loadLighting(campaignId, mapId);
+                if (doc.lights.length >= MAX_LIGHTS) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'too many lights' });
+                    return;
+                }
+                const clean = sanitizeLight(light, doc.lights.length);
+                if (!clean) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid light' });
+                    return;
+                }
+                if (info.role !== 'owner') {
+                    const okForPlayer = await canPlayerManageLight(campaignId, mapId, socket.userId, clean);
+                    if (!okForPlayer) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                }
+                // Dedupe falls id kollidiert.
+                if (doc.lights.some((l) => l.id === clean.id)) {
+                    clean.id = `lt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+                }
+                doc.lights.push(clean);
+                await doc.save();
+                broadcastLighting(campaignId, mapId, doc);
+                if (typeof ack === 'function') ack({ ok: true, light: clean });
+            } catch (e) {
+                console.error('lighting:light:add error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        socket.on('campaign:lighting:light:update', async ({ campaignId, mapId, lightId, patch } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId) || !isValidId(mapId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadLighting(campaignId, mapId);
+                const l = doc.lights.find((x) => x.id === lightId);
+                if (!l) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'not found' });
+                    return;
+                }
+                if (info.role !== 'owner') {
+                    const okForPlayer = await canPlayerManageLight(campaignId, mapId, socket.userId, l);
+                    if (!okForPlayer) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                }
+                // Nur ausgewaehlte Felder uebernehmen.
+                if (patch && typeof patch === 'object') {
+                    if (patch.enabled !== undefined) l.enabled = !!patch.enabled;
+                    if (patch.bright !== undefined) {
+                        const b = Number(patch.bright);
+                        if (Number.isFinite(b) && b >= 0 && b <= 200) l.bright = b;
+                    }
+                    if (patch.dim !== undefined) {
+                        const d = Number(patch.dim);
+                        if (Number.isFinite(d) && d >= 0 && d <= 200) l.dim = d;
+                    }
+                    if (typeof patch.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(patch.color)) {
+                        l.color = patch.color;
+                    }
+                    if (typeof patch.label === 'string') l.label = patch.label.slice(0, 64);
+                    // Position nur bei static und nur GM.
+                    if (info.role === 'owner' && l.kind === 'static') {
+                        if (Number.isFinite(+patch.x)) l.x = +patch.x;
+                        if (Number.isFinite(+patch.y)) l.y = +patch.y;
+                    }
+                }
+                doc.markModified('lights');
+                await doc.save();
+                broadcastLighting(campaignId, mapId, doc);
+                if (typeof ack === 'function') ack({ ok: true, light: l });
+            } catch (e) {
+                console.error('lighting:light:update error', e);
+                if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
+            }
+        });
+
+        socket.on('campaign:lighting:light:remove', async ({ campaignId, mapId, lightId } = {}, ack) => {
+            try {
+                if (!isValidId(campaignId) || !isValidId(mapId)) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'invalid id' });
+                    return;
+                }
+                const info = await roleFor(campaignId, socket.userId);
+                if (!info) {
+                    if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                    return;
+                }
+                const doc = await loadLighting(campaignId, mapId);
+                const l = doc.lights.find((x) => x.id === lightId);
+                if (!l) {
+                    if (typeof ack === 'function') ack({ ok: true });
+                    return;
+                }
+                if (info.role !== 'owner') {
+                    const okForPlayer = await canPlayerManageLight(campaignId, mapId, socket.userId, l);
+                    if (!okForPlayer) {
+                        if (typeof ack === 'function') ack({ ok: false, msg: 'forbidden' });
+                        return;
+                    }
+                }
+                doc.lights = doc.lights.filter((x) => x.id !== lightId);
+                await doc.save();
+                broadcastLighting(campaignId, mapId, doc);
+                if (typeof ack === 'function') ack({ ok: true });
+            } catch (e) {
+                console.error('lighting:light:remove error', e);
                 if (typeof ack === 'function') ack({ ok: false, msg: 'server error' });
             }
         });
