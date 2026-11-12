@@ -39,6 +39,21 @@ function validateEditorDoc(doc) {
     for (const v of doc.floor) {
         if (!Number.isInteger(v) || v < 0 || v > 32) return 'floor entry out of range';
     }
+    // Overlay (Runde 3d) — optional; wenn vorhanden, exakt w*h gross.
+    if (doc.overlay !== undefined) {
+        if (!Array.isArray(doc.overlay)) return 'overlay must be array';
+        if (doc.overlay.length !== w * h) return 'overlay length must equal width*height';
+        for (const v of doc.overlay) {
+            if (!Number.isInteger(v) || v < 0 || v > 255) return 'overlay entry must be 0..255';
+        }
+    }
+    if (doc.overlayMat !== undefined) {
+        if (!Array.isArray(doc.overlayMat)) return 'overlayMat must be array';
+        if (doc.overlayMat.length !== w * h) return 'overlayMat length must equal width*height';
+        for (const v of doc.overlayMat) {
+            if (!Number.isInteger(v) || v < 0 || v > 32) return 'overlayMat entry out of range';
+        }
+    }
     if (!Array.isArray(doc.walls)) return 'walls must be array';
     if (doc.walls.length > 20000) return 'too many walls';
     for (const wl of doc.walls) {
@@ -47,14 +62,39 @@ function validateEditorDoc(doc) {
         if (!Array.isArray(wl.b) || wl.b.length !== 2) return 'wall.b invalid';
         if (!Number.isInteger(wl.a[0]) || !Number.isInteger(wl.a[1])) return 'wall endpoint not int';
         if (!Number.isInteger(wl.b[0]) || !Number.isInteger(wl.b[1])) return 'wall endpoint not int';
-        if (wl.kind && wl.kind !== 'wall' && wl.kind !== 'door') return 'wall.kind invalid';
+        if (wl.kind && !['wall', 'door', 'window'].includes(wl.kind)) return 'wall.kind invalid';
+        if (wl.style && !['stone', 'wood'].includes(wl.style)) return 'wall.style invalid';
     }
     if (!Array.isArray(doc.objects)) return 'objects must be array';
     if (doc.objects.length > 5000) return 'too many objects';
     for (const o of doc.objects) {
         if (!isPlainObject(o)) return 'object entry not object';
-        if (typeof o.type !== 'string' || o.type.length > 32) return 'object.type invalid';
+        if (typeof o.type !== 'string' || o.type.length > 64) return 'object.type invalid';
         if (typeof o.x !== 'number' || typeof o.y !== 'number') return 'object pos invalid';
+        if (!Number.isFinite(o.x) || !Number.isFinite(o.y)) return 'object pos must be finite';
+        if (o.rot !== undefined && (!Number.isFinite(o.rot))) return 'object.rot invalid';
+        if (o.scale !== undefined && (!Number.isFinite(o.scale) || o.scale <= 0 || o.scale > 8)) return 'object.scale invalid';
+        if (o.sizeX !== undefined && (!Number.isFinite(o.sizeX) || o.sizeX <= 0 || o.sizeX > 20)) return 'object.sizeX invalid';
+        if (o.sizeY !== undefined && (!Number.isFinite(o.sizeY) || o.sizeY <= 0 || o.sizeY > 20)) return 'object.sizeY invalid';
+        if (o.flipX !== undefined && typeof o.flipX !== 'boolean') return 'object.flipX must be boolean';
+        if (o.flipY !== undefined && typeof o.flipY !== 'boolean') return 'object.flipY must be boolean';
+        if (o.layer !== undefined && !['above', 'below'].includes(o.layer)) return 'object.layer invalid';
+        if (o.assetUrl !== undefined && (typeof o.assetUrl !== 'string' || o.assetUrl.length > 600)) return 'object.assetUrl invalid';
+    }
+    if (doc.paths !== undefined) {
+        if (!Array.isArray(doc.paths)) return 'paths must be array';
+        if (doc.paths.length > 500) return 'too many paths';
+        for (const p of doc.paths) {
+            if (!isPlainObject(p)) return 'path entry not object';
+            if (!['road', 'river', 'bridge-wood', 'bridge-stone'].includes(p.kind)) return 'path.kind invalid';
+            if (!Array.isArray(p.points) || p.points.length < 2 || p.points.length > 500) return 'path.points invalid';
+            for (const pt of p.points) {
+                if (!Array.isArray(pt) || pt.length !== 2) return 'path.point invalid';
+                if (!Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) return 'path.point must be finite';
+            }
+            if (typeof p.width !== 'number' || p.width <= 0 || p.width > 10) return 'path.width invalid';
+            if (!Number.isInteger(p.material) || p.material < 0 || p.material > 32) return 'path.material invalid';
+        }
     }
     if (!Array.isArray(doc.labels)) return 'labels must be array';
     if (doc.labels.length > 2000) return 'too many labels';
@@ -322,3 +362,5 @@ router.delete('/:id', async (req, res) => {
 });
 
 module.exports = router;
+// Fuer Tests: Validator-Funktion direkt zugreifbar.
+module.exports.validateEditorDoc = validateEditorDoc;

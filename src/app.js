@@ -11,6 +11,7 @@ const mapsRoutes = require('./routes/maps');
 const campaignsRoutes = require('./routes/campaigns');
 const usersRoutes = require('./routes/users');
 const charactersRoutes = require('./routes/characters');
+const assetsRoutes = require('./routes/assets');
 
 /**
  * Baut die Express-App inkl. Middleware + Routen.
@@ -52,6 +53,14 @@ function createApp({ includeFileUploads = true } = {}) {
     app.use('/api/campaigns', campaignsRoutes);
     app.use('/api/users', usersRoutes);
     app.use('/api/characters', charactersRoutes);
+    // User-Assets fuer den 2D-Editor. Upload-Route (multipart) muss VOR dem
+    // Default-Parser liegen — der haengt hier am selben Prefix, deshalb mounten
+    // wir sie als Sub-Router. Lesen/Loeschen (JSON) geht auch ohne Firebase.
+    if (includeFileUploads) {
+        const assetUploadRoutes = require('./routes/assetUpload');
+        app.use('/api/assets', assetUploadRoutes);
+    }
+    app.use('/api/assets', assetsRoutes);
 
     return app;
 }
